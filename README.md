@@ -1,4 +1,4 @@
-# realtime-web
+# realtime-web-comparison
 Experimenting with WebSocket, WebRTC, and WebTransport by streaming 2500 coordinates from server to client to visualize.
 > Checkout the discussion on [HackerNews](https://news.ycombinator.com/item?id=34137974)
 
