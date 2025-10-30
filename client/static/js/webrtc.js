@@ -53,7 +53,7 @@ webRTCBtn.onclick = (_) => {
         if (e.candidate === null) {
             iceFinished = true;
             while (wsClient.readyState !== 1) await new Promise(r => setTimeout(r, 10));
-            wsClient.send(btoa(JSON.stringify(conn.localDescription)));
+            wsClient.send(JSON.stringify(conn.localDescription));
         }
     }
 
@@ -87,7 +87,7 @@ webRTCBtn.onclick = (_) => {
     wsClient.onmessage = (e) => {
         try {
             console.info(`Received message from signaling server: ${e.data}`);
-            conn.setRemoteDescription(new RTCSessionDescription(JSON.parse(atob(e.data)))).then();
+            conn.setRemoteDescription(new RTCSessionDescription(JSON.parse(e.data))).then();
         } catch (e) {
             console.error(e);
         }
