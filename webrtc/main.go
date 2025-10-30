@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -9,23 +8,23 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
-	"github.com/pion/webrtc/v3"
+	"github.com/pion/webrtc/v4"
 )
+
+// create global peer connection just for testing
+// this is so that it can outlive the HTTP handler scope
+var peerConn *webrtc.PeerConnection = nil
 
 func encode(obj interface{}) string {
 	b, err := json.Marshal(obj)
 	if err != nil {
 		log.Fatal(err)
 	}
-	return base64.StdEncoding.EncodeToString(b)
+	return string(b)
 }
 
 func decode(in string, obj interface{}) {
-	b, err := base64.StdEncoding.DecodeString(in)
-	if err != nil {
-		log.Fatal(err)
-	}
-	err = json.Unmarshal(b, obj)
+	err := json.Unmarshal([]byte(in), obj)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -44,14 +43,25 @@ func main() {
 		var upgrader = websocket.Upgrader{
 			CheckOrigin: func(r *http.Request) bool { return true },
 		}
+
+		// Check if this is a WebSocket upgrade request
+		// This is so that we can visit this server in a browser to accept the TLS certificate
+		if r.Header.Get("Upgrade") != "websocket" {
+			// Regular HTTP request - just return OK so Chrome can accept the certificate
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte("WebRTC Signaling Server - Use WebSocket connection for signaling"))
+			return
+		}
+
 		wsConn, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
-			log.Fatal(err)
+			log.Printf("WebSocket upgrade error: %v", err)
+			return
 		}
 
 		log.Println("Client Connected")
 
-		peerConn, err := webrtc.NewPeerConnection(config)
+		peerConn, err = webrtc.NewPeerConnection(config)
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -61,6 +71,9 @@ func main() {
 			if s == webrtc.PeerConnectionStateFailed {
 				log.Fatal("Peer Connection failed")
 			}
+		})
+		peerConn.OnICECandidate(func(i *webrtc.ICECandidate) {
+			log.Printf("New ICE candidate: %v\n", i)
 		})
 		peerConn.OnDataChannel(func(channel *webrtc.DataChannel) {
 			channel.OnOpen(func() {
@@ -103,7 +116,7 @@ func main() {
 			log.Fatal(err)
 		}
 
-		//log.Printf("Client offer: %s\n", offer)
+		log.Printf("Client offer: %s\n", offer)
 
 		answer, err := peerConn.CreateAnswer(nil)
 		if err != nil {
@@ -116,7 +129,7 @@ func main() {
 		gatherComplete := webrtc.GatheringCompletePromise(peerConn)
 		<-gatherComplete
 
-		//log.Printf("Server answer: %s\n", *peerConn.LocalDescription())
+		log.Printf("Server answer: %s\n", *peerConn.LocalDescription())
 
 		if err := wsConn.WriteMessage(websocket.TextMessage, []byte(encode(*peerConn.LocalDescription()))); err != nil {
 			log.Fatal(err)

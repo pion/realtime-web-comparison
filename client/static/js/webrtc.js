@@ -2,7 +2,6 @@ import {chart, initCanvas, visualizePacket} from "./common.js";
 
 const webRTCBtn = document.getElementById("webrtc");
 const reliable = false;
-const local = true; // For local experimentation, it's not necessary to wait for ICE gathering to complete.
 
 webRTCBtn.onclick = (_) => {
     initCanvas();
@@ -18,12 +17,43 @@ webRTCBtn.onclick = (_) => {
         conn.createDataChannel('dataChannel', {ordered: true, maxRetransmits: 0});
     const decoder = new TextDecoder("utf-8");
 
+    // Add connection state logging
+    conn.onconnectionstatechange = () => {
+        console.info(`WebRTC Connection State: ${conn.connectionState}`);
+    };
+    
+    conn.oniceconnectionstatechange = () => {
+        console.info(`ICE Connection State: ${conn.iceConnectionState}`);
+    };
+    
+    conn.onicegatheringstatechange = () => {
+        console.info(`ICE Gathering State: ${conn.iceGatheringState}`);
+    };
+
+    wsClient.onopen = () => {
+        console.info('WebSocket connected to signaling server');
+    };
+
+    wsClient.onerror = (err) => {
+        console.error('WebSocket error:', err);
+    };
+
+    wsClient.onclose = () => {
+        console.info('WebSocket connection closed');
+    };
+
+    console.info("Creating WebRTC offer...");
+    conn.createOffer().then(o => {
+        conn.setLocalDescription(o);
+        console.info(`Created offer and set local description: ${o}`);
+    });
+
     conn.onicecandidate = async e => {
-        // console.log(`New ice candidate: ${e.candidate}`)
-        if (local || e.candidate === null) {
+        console.info(`New ice candidate: ${e.candidate}`)
+        if (e.candidate === null) {
             iceFinished = true;
             while (wsClient.readyState !== 1) await new Promise(r => setTimeout(r, 10));
-            wsClient.send(btoa(JSON.stringify(conn.localDescription)));
+            wsClient.send(JSON.stringify(conn.localDescription));
         }
     }
 
@@ -54,11 +84,10 @@ webRTCBtn.onclick = (_) => {
         console.info('Disconnected from WebRTC server.');
     };
 
-    conn.createOffer().then(o => conn.setLocalDescription(o));
-
     wsClient.onmessage = (e) => {
         try {
-            conn.setRemoteDescription(new RTCSessionDescription(JSON.parse(atob(e.data)))).then();
+            console.info(`Received message from signaling server: ${e.data}`);
+            conn.setRemoteDescription(new RTCSessionDescription(JSON.parse(e.data))).then();
         } catch (e) {
             console.error(e);
         }
