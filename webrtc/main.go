@@ -9,7 +9,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
-	"github.com/pion/webrtc/v3"
+	"github.com/pion/webrtc/v4"
 )
 
 func encode(obj interface{}) string {
@@ -61,6 +61,9 @@ func main() {
 			if s == webrtc.PeerConnectionStateFailed {
 				log.Fatal("Peer Connection failed")
 			}
+		})
+		peerConn.OnICECandidate(func(i *webrtc.ICECandidate) {
+			log.Printf("New ICE candidate: %v\n", i)
 		})
 		peerConn.OnDataChannel(func(channel *webrtc.DataChannel) {
 			channel.OnOpen(func() {
@@ -116,7 +119,7 @@ func main() {
 		gatherComplete := webrtc.GatheringCompletePromise(peerConn)
 		<-gatherComplete
 
-		//log.Printf("Server answer: %s\n", *peerConn.LocalDescription())
+		log.Printf("Server answer: %s\n", *peerConn.LocalDescription())
 
 		if err := wsConn.WriteMessage(websocket.TextMessage, []byte(encode(*peerConn.LocalDescription()))); err != nil {
 			log.Fatal(err)
