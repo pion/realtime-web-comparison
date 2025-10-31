@@ -1,29 +1,10 @@
 # realtime-web-comparison
 Experimenting with WebSocket, WebRTC, and WebTransport by streaming 2500 coordinates from server to client to visualize.
-> Checkout the discussion on [HackerNews](https://news.ycombinator.com/item?id=34137974)
 
-## Demos
-
-<details>
-<summary>0% Packet loss</summary>
-
-https://user-images.githubusercontent.com/40727318/215340433-ac2543e7-e2eb-4c4f-b3c1-d5adc4abffd3.mp4
-
-</details>
-
-<details>
-<summary>15% Packet loss (unreliable WebRTC/WebTransport)</summary>
-
-https://user-images.githubusercontent.com/40727318/215340455-66b51c24-9015-4086-9453-4230cf72cea6.mp4
-
-</details>
-
-<details>
-<summary>15% Packet loss (reliable WebRTC/WebTransport)</summary>
-
-https://user-images.githubusercontent.com/40727318/215340465-ebe2c5cf-839c-4822-9df6-eb177fe2bb77.mp4
-
-</details>
+# NOTE: This repository is currently in flux. 
+- The WebTransport server currently does not work, however WebSockets and the WebRTC datachannels do
+- We're doing our best to update all code to the latest versions of their dependencies.
+- The following is from the original version of this repository.
 
 ## Experiment details
 
