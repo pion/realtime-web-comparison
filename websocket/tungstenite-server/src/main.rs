@@ -1,13 +1,11 @@
-use std::fs::File;
-use std::io::BufReader;
 use std::net::TcpListener;
 use std::path::Path;
 use std::sync::Arc;
 use std::thread::spawn;
 
-use rustls::{ServerConfig, ServerConnection, StreamOwned};
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::{ServerConfig, ServerConnection, StreamOwned};
 use tungstenite::accept;
 
 /// A WebSocket echo server over TLS (wss://)
@@ -35,7 +33,10 @@ fn main() {
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
-                eprintln!("incoming TCP connection from {}", stream.peer_addr().unwrap());
+                eprintln!(
+                    "incoming TCP connection from {}",
+                    stream.peer_addr().unwrap()
+                );
                 let cfg = Arc::clone(&config);
                 spawn(move || {
                     // Wrap TCP in a rustls TLS stream.
@@ -50,20 +51,20 @@ fn main() {
 
                     match accept(tls_stream) {
                         Ok(mut websocket) => loop {
-                            match websocket.read() {
-                                Ok(msg) => {
-                                    if msg.is_binary() || msg.is_text() {
-                                        if let Err(e) = websocket.send(msg) {
-                                            eprintln!("send error: {e}");
-                                            break;
-                                        }
+                            // Send message so we can test the server performance
+                            for i in (10..=510).step_by(10) {
+                                for j in (10..=510).step_by(10) {
+                                    let message = format!("{j},{i}");
+                                    if let Err(e) = websocket.send(message.into()) {
+                                        eprintln!("send error: {e}");
+                                        break;
                                     }
-                                }
-                                Err(e) => {
-                                    eprintln!("read error: {e}");
-                                    break;
+                                    std::thread::sleep(std::time::Duration::from_millis(1));
                                 }
                             }
+                            // break after one batch for demo purposes
+                            eprintln!("Completed one batch of messages, closing connection.");
+                            break;
                         },
                         Err(e) => {
                             eprintln!("websocket handshake failed: {e}");
