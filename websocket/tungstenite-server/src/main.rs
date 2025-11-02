@@ -28,7 +28,7 @@ fn main() {
     let config = Arc::new(config);
 
     let listener = TcpListener::bind("127.0.0.1:8000").expect("bind 127.0.0.1:8000");
-    eprintln!("tungstenite echo server listening on wss://127.0.0.1:8000");
+    eprintln!("tungstenite server listening on wss://127.0.0.1:8000");
 
     for stream in listener.incoming() {
         match stream {
