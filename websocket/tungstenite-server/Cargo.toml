@@ -1,9 +1,0 @@
-[package]
-name = "tungstenite-server"
-version = "0.1.0"
-edition = "2024"
-
-[dependencies]
-tungstenite = "0.28"
-rustls = "0.23"
-rustls-pki-types = "1.13.0"
