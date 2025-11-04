@@ -142,5 +142,5 @@ func main() {
 
 	log.Println("Signaling server is listening at :8002")
 	log.Fatal(http.ListenAndServeTLS(":8002",
-		"../certs/localhost.pem", "../certs/localhost-key.pem", nil))
+		"../../certs/localhost.pem", "../../certs/localhost-key.pem", nil))
 }
