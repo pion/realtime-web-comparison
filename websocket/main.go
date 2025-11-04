@@ -23,7 +23,7 @@ func main() {
 		log.Println("Client Connected")
 		for i := 10; i < 510; i += 10 {
 			for j := 10; j < 510; j += 10 {
-				message := fmt.Sprintf("%03d,%03d", j, i)
+				message := fmt.Sprintf("%d,%d", j, i)
 				if err := conn.WriteMessage(websocket.TextMessage, []byte(message)); err != nil {
 					log.Fatal(err)
 				}
