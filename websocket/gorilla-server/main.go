@@ -36,5 +36,5 @@ func main() {
 	})
 	log.Println("Server is listening at :8000")
 	log.Fatal(http.ListenAndServeTLS(":8000",
-		"../certs/localhost.pem", "../certs/localhost-key.pem", nil))
+		"../../certs/localhost.pem", "../../certs/localhost-key.pem", nil))
 }
