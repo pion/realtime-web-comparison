@@ -21,11 +21,8 @@ func main() {
 		w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
 
-		// Start a goroutine to send messages after the connection is established
+		// Start a goroutine to send messages
 		go func() {
-			// Give the connection a moment to fully establish
-			time.Sleep(10 * time.Millisecond)
-
 			for i := 10; i < 510; i += 10 {
 				for j := 10; j < 510; j += 10 {
 					ev := &sse.Message{}
