@@ -26,6 +26,12 @@ export let chart = new Chart(chartContext, {
                 showLine: true,
                 borderDash: [2, 5],
             },
+            {
+                data: [],
+                label: "Server Sent Events",
+                borderColor: "#000000ff",
+                showLine: true,
+            }
         ]
     },
     options: {
