@@ -1,8 +1,8 @@
 # realtime-web-comparison
-Experimenting with WebSocket, WebRTC, and WebTransport by streaming 2500 coordinates from server to client to visualize.
+Experimenting with Server Sent Events, WebSocket, WebRTC, and WebTransport by streaming 2500 coordinates from server to client to visualize.
 
 # NOTE: This repository is currently in flux. 
-- The WebTransport server currently does not work, however WebSockets and the WebRTC datachannels do
+- The WebTransport server currently does not work
 - We're doing our best to update all code to the latest versions of their dependencies.
 
 **Additional notes:**
@@ -11,9 +11,27 @@ Experimenting with WebSocket, WebRTC, and WebTransport by streaming 2500 coordin
 
 - No limits were specified on packet size or how protocols buffer packets.
 
+The pseudo code of what each test is doing looks somewhat like this:
+
+```go
+for i := 10; i < 510; i += 10 {
+    for j := 10; j < 510; j += 10 {
+        message := fmt.Sprintf("%d,%d", j, i)
+        if err := conn.WriteMessage(websocket.TextMessage, []byte(message)); err != nil {
+            log.Fatal(err)
+        }
+        time.Sleep(1 * time.Millisecond)
+    }
+}
+```
+
 ## Dependencies
+- Server Sent Events
+    - [tmaxmax/go-sse](https://github.com/tmaxmax/go-sse)
+    - [tokio-rs/axum](https://github.com/tokio-rs/axum)
 - WebSockets
     - [gorilla/websocket](https://github.com/gorilla/websocket)
+    - [snapview/tungstenite-rs](https://github.com/snapview/tungstenite-rs)
 - WebRTC
     - [pion/webrtc](https://github.com/pion/webrtc)
 - WebTransport
