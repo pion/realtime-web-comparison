@@ -1,0 +1,6 @@
+{
+    "rust-analyzer.linkedProjects": [
+        "webrtc\\webrtc-rs-server\\Cargo.toml",
+        "websocket\\tungstenite-server\\Cargo.toml"
+    ]
+}
