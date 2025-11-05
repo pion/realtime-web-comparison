@@ -6,6 +6,8 @@ use std::thread::spawn;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::{ServerConfig, ServerConnection, StreamOwned};
+use str0m::Rtc;
+use str0m::change::SdpOffer;
 use tungstenite::accept;
 
 /// A WebSocket echo server over TLS (wss://)
@@ -51,8 +53,31 @@ fn main() {
 
                     match accept(tls_stream) {
                         Ok(mut websocket) => loop {
-                           if let Ok(msg) = websocket.read_message() {
+                            if let Ok(msg) = websocket.read() {
                                 eprintln!("Received message: {}", msg);
+                                // create RTC client
+                                let offer: SdpOffer =
+                                    serde_json::from_slice(&msg.into_data()).expect("serialized offer");
+                                let mut rtc = Rtc::builder()
+                                    // Uncomment this to see statistics
+                                    // .set_stats_interval(Some(Duration::from_secs(1)))
+                                    // .set_ice_lite(true)
+                                    .build();
+
+                                // Add the shared UDP socket as a host candidate
+                                /*
+                                let candidate =
+                                    Candidate::host(addr, "udp").expect("a host candidate");
+                                rtc.add_local_candidate(candidate).unwrap();
+                                */
+
+                                // Create an SDP Answer.
+                                let answer = rtc
+                                    .sdp_api()
+                                    .accept_offer(offer)
+                                    .expect("offer to be accepted");
+
+                                websocket.write(answer.to_sdp_string().into()).expect("send answer");
                             } else {
                                 eprintln!("Client disconnected");
                                 break;
@@ -60,7 +85,9 @@ fn main() {
                         },
                         Err(e) => {
                             eprintln!("websocket handshake failed: {e}");
-                            eprintln!("Hint: Ensure your client connects with wss://localhost:8002 and trusts the local certificate in certs/.");
+                            eprintln!(
+                                "Hint: Ensure your client connects with wss://localhost:8002 and trusts the local certificate in certs/."
+                            );
                         }
                     }
                 });
