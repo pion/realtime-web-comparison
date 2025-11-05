@@ -24,9 +24,28 @@ use axum::{
     routing::any,
 };
 use axum_extra::TypedHeader;
+use rustls::ServerConfig as RustlsServerConfig;
 use rustls::crypto::CryptoProvider;
+use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use webrtc::{
+    api::{
+        APIBuilder, interceptor_registry::register_default_interceptors, media_engine::MediaEngine,
+    },
+    data_channel::RTCDataChannel,
+    ice_transport::{ice_candidate::RTCIceCandidate, ice_server::RTCIceServer},
+    peer_connection::{
+        RTCPeerConnection, configuration::RTCConfiguration,
+        peer_connection_state::RTCPeerConnectionState,
+        sdp::session_description::RTCSessionDescription,
+    },
+};
 
-use std::{net::SocketAddr, path::PathBuf};
+use std::{
+    net::SocketAddr,
+    path::PathBuf,
+    sync::{Arc, OnceLock},
+};
 use std::{ops::ControlFlow, path::Path};
 use tower_http::{
     services::ServeDir,
@@ -43,6 +62,8 @@ use axum_extra::headers;
 //allows to split the websocket stream into separate TX and RX branches
 use futures_util::{sink::SinkExt, stream::StreamExt};
 
+static PEER_CONNECTION: OnceLock<Arc<RTCPeerConnection>> = OnceLock::new();
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::registry()
@@ -53,7 +74,7 @@ async fn main() {
         )
         .with(tracing_subscriber::fmt::layer())
         .init();
-    
+
     CryptoProvider::install_default(rustls::crypto::ring::default_provider()).unwrap();
 
     let assets_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets");
@@ -74,11 +95,22 @@ async fn main() {
     // run it with hyper
     let bind_addr = SocketAddr::from(([127, 0, 0, 1], 8002));
     tracing::debug!("listening on {}", bind_addr);
-    let tls_config = axum_server::tls_rustls::RustlsConfig::from_pem_file(cert_path, key_path)
+    // Build a Rustls ServerConfig and force ALPN to http/1.1 so WebSocket upgrade works over TLS
+    let cert = CertificateDer::from_pem_file(cert_path).expect("load certs");
+    let key = PrivateKeyDer::from_pem_file(key_path).expect("load private key");
+    let mut tls_config = RustlsServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert], key)
+        .expect("invalid cert/key");
+    tls_config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    let tls_config =
+        axum_server::tls_rustls::RustlsConfig::from_config(std::sync::Arc::new(tls_config));
+    let server = axum_server::bind_rustls(bind_addr, tls_config);
+    // Provide peer SocketAddr to handlers so ConnectInfo extractor works (prevents 500s on WS upgrade)
+    server
+        .serve(app.into_make_service_with_connect_info::<SocketAddr>())
         .await
         .unwrap();
-    let server = axum_server::bind_rustls(bind_addr, tls_config);
-    server.serve(app.into_make_service()).await.unwrap();
 }
 
 /// The handler for the HTTP request (this gets called when the HTTP request lands at the start
@@ -118,14 +150,106 @@ async fn handle_socket(mut socket: WebSocket, who: SocketAddr) {
         return;
     }
 
-    // receive single message from a client (we can either receive or send with socket).
-    // this will likely be the Pong for our Ping or a hello message from client.
-    // waiting for message from a client will block this task, but will not block other client's
-    // connections.
-    if let Some(msg) = socket.recv().await {
+    // Create a MediaEngine object to configure the supported codec
+    let mut m = MediaEngine::default();
+
+    // Register default codecs
+    m.register_default_codecs().unwrap();
+
+    // Create a InterceptorRegistry. This is the user configurable RTP/RTCP Pipeline.
+    // This provides NACKs, RTCP Reports and other features. If you use `webrtc.NewPeerConnection`
+    // this is enabled by default. If you are manually managing You MUST create a InterceptorRegistry
+    // for each PeerConnection.
+    let mut registry = interceptor::registry::Registry::new();
+
+    // Use the default set of Interceptors
+    registry = register_default_interceptors(registry, &mut m).unwrap();
+
+    // Create the API object with the MediaEngine
+    let api = APIBuilder::new()
+        .with_media_engine(m)
+        .with_interceptor_registry(registry)
+        .build();
+
+    // Prepare the configuration
+    let config = RTCConfiguration {
+        ice_servers: vec![RTCIceServer {
+            urls: vec!["stun:stun.l.google.com:19302".to_owned()],
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+
+    // Create a new RTCPeerConnection
+    let peer_connection = Arc::new(api.new_peer_connection(config).await.unwrap());
+
+    // Set the handler for Peer connection state
+    // This will notify you when the peer has connected/disconnected
+    peer_connection.on_peer_connection_state_change(Box::new(move |s: RTCPeerConnectionState| {
+        println!("Peer Connection State has changed: {s}");
+
+        if s == RTCPeerConnectionState::Failed {
+            // Wait until PeerConnection has had no network activity for 30 seconds or another failure. It may be reconnected using an ICE Restart.
+            // Use webrtc.PeerConnectionStateDisconnected if you are interested in detecting faster timeout.
+            // Note that the PeerConnection may come back from PeerConnectionStateDisconnected.
+            println!("Peer Connection has gone to failed exiting");
+        }
+
+        Box::pin(async {})
+    }));
+
+    peer_connection.on_ice_candidate(Box::new(move |candidate: Option<RTCIceCandidate>| {
+        Box::pin(async move {
+            if let Some(c) = candidate {
+                println!("New ICE candidate: {}", c.to_json().unwrap().candidate);
+            } else {
+                println!("ICE gathering complete");
+            }
+        })
+    }));
+
+    peer_connection.on_data_channel(Box::new(move |data_channel: Arc<RTCDataChannel>| {
+        println!(
+            "New DataChannel {}-{}",
+            data_channel.label(),
+            data_channel.id()
+        );
+        Box::pin(async move {})
+    }));
+
+    while let Some(msg) = socket.recv().await {
         if let Ok(msg) = msg {
-            if process_message(msg, who).is_break() {
+            let sdp_bytes = msg.into_text().expect("msg to text");
+            println!("Received SDP offer from client {sdp_bytes}");
+            if let Some(offer) = serde_json::from_str::<RTCSessionDescription>(&sdp_bytes).ok() {
+                println!("Received offer: {offer:?}");
+
+                let pc = peer_connection.clone();
+
+                // Apply the offer as the remote description
+                pc.set_remote_description(offer).await.unwrap();
+
+                // Create an answer to send to the browser
+                let answer = pc.create_answer(None).await.unwrap();
+
+                // Sets the LocalDescription, and starts our UDP listeners
+                pc.set_local_description(answer).await.unwrap();
+
+                // Create channel that is blocked until ICE Gathering is complete
+                let mut gather_complete = pc.gathering_complete_promise().await;
+
+                // Block until ICE Gathering is complete, disabling trickle ICE
+                // we do this because we only can exchange one signaling message
+                // in a production application you should exchange ICE Candidates via OnICECandidate
+                let _ = gather_complete.recv().await;
+
+                println!("Connection established, waiting for messages...");
+
+                PEER_CONNECTION.set(pc).unwrap();
                 return;
+            } else {
+                println!("Could not parse SDP from client {who}");
+                continue;
             }
         } else {
             println!("client {who} abruptly disconnected");
@@ -133,120 +257,6 @@ async fn handle_socket(mut socket: WebSocket, who: SocketAddr) {
         }
     }
 
-    // Since each client gets individual statemachine, we can pause handling
-    // when necessary to wait for some external event (in this case illustrated by sleeping).
-    // Waiting for this client to finish getting its greetings does not prevent other clients from
-    // connecting to server and receiving their greetings.
-    for i in 1..5 {
-        if socket
-            .send(Message::Text(format!("Hi {i} times!").into()))
-            .await
-            .is_err()
-        {
-            println!("client {who} abruptly disconnected");
-            return;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    }
-
-    // By splitting socket we can send and receive at the same time. In this example we will send
-    // unsolicited messages to client based on some sort of server's internal event (i.e .timer).
-    let (mut sender, mut receiver) = socket.split();
-
-    // Spawn a task that will push several messages to the client (does not matter what client does)
-    let mut send_task = tokio::spawn(async move {
-        let n_msg = 20;
-        for i in 0..n_msg {
-            // In case of any websocket error, we exit.
-            if sender
-                .send(Message::Text(format!("Server message {i} ...").into()))
-                .await
-                .is_err()
-            {
-                return i;
-            }
-
-            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-        }
-
-        println!("Sending close to {who}...");
-        if let Err(e) = sender
-            .send(Message::Close(Some(CloseFrame {
-                code: axum::extract::ws::close_code::NORMAL,
-                reason: Utf8Bytes::from_static("Goodbye"),
-            })))
-            .await
-        {
-            println!("Could not send Close due to {e}, probably it is ok?");
-        }
-        n_msg
-    });
-
-    // This second task will receive messages from client and print them on server console
-    let mut recv_task = tokio::spawn(async move {
-        let mut cnt = 0;
-        while let Some(Ok(msg)) = receiver.next().await {
-            cnt += 1;
-            // print message and break if instructed to do so
-            if process_message(msg, who).is_break() {
-                break;
-            }
-        }
-        cnt
-    });
-
-    // If any one of the tasks exit, abort the other.
-    tokio::select! {
-        rv_a = (&mut send_task) => {
-            match rv_a {
-                Ok(a) => println!("{a} messages sent to {who}"),
-                Err(a) => println!("Error sending messages {a:?}")
-            }
-            recv_task.abort();
-        },
-        rv_b = (&mut recv_task) => {
-            match rv_b {
-                Ok(b) => println!("Received {b} messages"),
-                Err(b) => println!("Error receiving messages {b:?}")
-            }
-            send_task.abort();
-        }
-    }
-
     // returning from the handler closes the websocket connection
     println!("Websocket context {who} destroyed");
-}
-
-/// helper to print contents of messages to stdout. Has special treatment for Close.
-fn process_message(msg: Message, who: SocketAddr) -> ControlFlow<(), ()> {
-    match msg {
-        Message::Text(t) => {
-            println!(">>> {who} sent str: {t:?}");
-        }
-        Message::Binary(d) => {
-            println!(">>> {who} sent {} bytes: {d:?}", d.len());
-        }
-        Message::Close(c) => {
-            if let Some(cf) = c {
-                println!(
-                    ">>> {who} sent close with code {} and reason `{}`",
-                    cf.code, cf.reason
-                );
-            } else {
-                println!(">>> {who} somehow sent close message without CloseFrame");
-            }
-            return ControlFlow::Break(());
-        }
-
-        Message::Pong(v) => {
-            println!(">>> {who} sent pong with {v:?}");
-        }
-        // You should never need to manually handle Message::Ping, as axum's websocket library
-        // will do so for you automagically by replying with Pong and copying the v according to
-        // spec. But if you need the contents of the pings you can see them here.
-        Message::Ping(v) => {
-            println!(">>> {who} sent ping with {v:?}");
-        }
-    }
-    ControlFlow::Continue(())
 }
