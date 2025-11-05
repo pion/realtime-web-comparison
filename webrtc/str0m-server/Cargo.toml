@@ -1,0 +1,12 @@
+[package]
+name = "str0m-server"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+rustls = "0.23.35"
+rustls-pki-types = "1.13.0"
+str0m = { version = "0.11.1", default-features = false, features = ["wincrypto"] }
+tracing = { version = "0.1.41", features = ["async-await"] }
+tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
+tungstenite = { version = "0.28.0", features = ["rustls-tls-webpki-roots"] }
