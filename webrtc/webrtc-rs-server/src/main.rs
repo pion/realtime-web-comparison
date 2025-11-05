@@ -1,191 +1,252 @@
-use std::net::TcpListener;
-use std::path::Path;
-use std::sync::{Arc, LazyLock, OnceLock};
-use std::thread::spawn;
+//! Example websocket server.
+//!
+//! Run the server with
+//! ```not_rust
+//! cargo run -p example-websockets --bin example-websockets
+//! ```
+//!
+//! Run a browser client with
+//! ```not_rust
+//! firefox http://localhost:3000
+//! ```
+//!
+//! Alternatively you can run the rust client (showing two
+//! concurrent websocket connections being established) with
+//! ```not_rust
+//! cargo run -p example-websockets --bin example-client
+//! ```
 
+use axum::{
+    Router,
+    body::Bytes,
+    extract::ws::{Message, Utf8Bytes, WebSocket, WebSocketUpgrade},
+    response::IntoResponse,
+    routing::any,
+};
+use axum_extra::TypedHeader;
 use rustls::crypto::CryptoProvider;
-use rustls::pki_types::pem::PemObject;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use rustls::{ServerConfig, ServerConnection, StreamOwned};
-use tungstenite::accept;
 
-use tokio::time::Duration;
-use webrtc::api::APIBuilder;
-use webrtc::api::interceptor_registry::register_default_interceptors;
-use webrtc::api::media_engine::MediaEngine;
-use webrtc::data_channel::RTCDataChannel;
-use webrtc::data_channel::data_channel_message::DataChannelMessage;
-use webrtc::ice_transport::ice_candidate::RTCIceCandidate;
-use webrtc::ice_transport::ice_server::RTCIceServer;
-use webrtc::interceptor::registry::Registry;
-use webrtc::peer_connection::configuration::RTCConfiguration;
-use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
-use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
-use webrtc::peer_connection::{RTCPeerConnection, math_rand_alpha};
+use std::{net::SocketAddr, path::PathBuf};
+use std::{ops::ControlFlow, path::Path};
+use tower_http::{
+    services::ServeDir,
+    trace::{DefaultMakeSpan, TraceLayer},
+};
 
-static PEER_CONNECTION: OnceLock<Arc<RTCPeerConnection>> = OnceLock::new();
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-/// A WebSocket echo server over TLS (wss://)
+//allows to extract the IP of connecting user
+use axum::extract::connect_info::ConnectInfo;
+use axum::extract::ws::CloseFrame;
+use axum_extra::headers;
+
+//allows to split the websocket stream into separate TX and RX branches
+use futures_util::{sink::SinkExt, stream::StreamExt};
+
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() {
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                format!("{}=debug,tower_http=debug", env!("CARGO_CRATE_NAME")).into()
+            }),
+        )
+        .with(tracing_subscriber::fmt::layer())
+        .init();
+    
     CryptoProvider::install_default(rustls::crypto::ring::default_provider()).unwrap();
+
+    let assets_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets");
+
     // Use fixed relative paths from this crate to the repo certs
     let cert_path = Path::new("../../certs/localhost.pem");
     let key_path = Path::new("../../certs/localhost-key.pem");
 
-    eprintln!("Using certificate: {}", cert_path.display());
-    eprintln!("Using private key: {}", key_path.display());
+    // build our application with some routes
+    let app = Router::new()
+        .fallback_service(ServeDir::new(assets_dir).append_index_html_on_directories(true))
+        .route("/", any(ws_handler))
+        // logging so we can see what's going on
+        .layer(
+            TraceLayer::new_for_http()
+                .make_span_with(DefaultMakeSpan::default().include_headers(true)),
+        );
+    // run it with hyper
+    let bind_addr = SocketAddr::from(([127, 0, 0, 1], 8002));
+    tracing::debug!("listening on {}", bind_addr);
+    let tls_config = axum_server::tls_rustls::RustlsConfig::from_pem_file(cert_path, key_path)
+        .await
+        .unwrap();
+    let server = axum_server::bind_rustls(bind_addr, tls_config);
+    server.serve(app.into_make_service()).await.unwrap();
+}
 
-    let cert = CertificateDer::from_pem_file(cert_path).expect("load certs");
-    let key = PrivateKeyDer::from_pem_file(key_path).expect("load private key");
+/// The handler for the HTTP request (this gets called when the HTTP request lands at the start
+/// of websocket negotiation). After this completes, the actual switching from HTTP to
+/// websocket protocol will occur.
+/// This is the last point where we can extract TCP/IP metadata such as IP address of the client
+/// as well as things from HTTP headers such as user-agent of the browser etc.
+async fn ws_handler(
+    ws: WebSocketUpgrade,
+    user_agent: Option<TypedHeader<headers::UserAgent>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+) -> impl IntoResponse {
+    let user_agent = if let Some(TypedHeader(user_agent)) = user_agent {
+        user_agent.to_string()
+    } else {
+        String::from("Unknown browser")
+    };
+    println!("`{user_agent}` at {addr} connected.");
+    // finalize the upgrade process by returning upgrade callback.
+    // we can customize the callback by sending additional info such as address.
+    ws.on_upgrade(move |socket| handle_socket(socket, addr))
+}
 
-    // Build rustls server config (no client auth)
-    let config = ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(vec![cert], key)
-        .expect("invalid cert/key");
-    let config = Arc::new(config);
+/// Actual websocket statemachine (one will be spawned per connection)
+async fn handle_socket(mut socket: WebSocket, who: SocketAddr) {
+    // send a ping (unsupported by some browsers) just to kick things off and get a response
+    if socket
+        .send(Message::Ping(Bytes::from_static(&[1, 2, 3])))
+        .await
+        .is_ok()
+    {
+        println!("Pinged {who}...");
+    } else {
+        println!("Could not send ping {who}!");
+        // no Error here since the only thing we can do is to close the connection.
+        // If we can not send messages, there is no way to salvage the statemachine anyway.
+        return;
+    }
 
-    let listener = TcpListener::bind("127.0.0.1:8002").expect("bind 127.0.0.1:8002");
-    eprintln!("tungstenite server listening on wss://127.0.0.1:8002");
-
-    for stream in listener.incoming() {
-        match stream {
-            Ok(stream) => {
-                eprintln!(
-                    "incoming TCP connection from {}",
-                    stream.peer_addr().unwrap()
-                );
-                let cfg = Arc::clone(&config);
-                tokio::spawn(async move {
-                    // Wrap TCP in a rustls TLS stream.
-                    let conn = match ServerConnection::new(cfg) {
-                        Ok(c) => c,
-                        Err(e) => {
-                            eprintln!("TLS ServerConnection error: {e}");
-                            return;
-                        }
-                    };
-                    let tls_stream = StreamOwned::new(conn, stream);
-
-                    match accept(tls_stream) {
-                        Ok(mut websocket) => {
-                            // Create a MediaEngine object to configure the supported codec
-                            let mut m = MediaEngine::default();
-
-                            // Register default codecs
-                            m.register_default_codecs().unwrap();
-
-                            // Create a InterceptorRegistry. This is the user configurable RTP/RTCP Pipeline.
-                            // This provides NACKs, RTCP Reports and other features. If you use `webrtc.NewPeerConnection`
-                            // this is enabled by default. If you are manually managing You MUST create a InterceptorRegistry
-                            // for each PeerConnection.
-                            let mut registry = Registry::new();
-
-                            // Use the default set of Interceptors
-                            registry = register_default_interceptors(registry, &mut m).unwrap();
-
-                            // Create the API object with the MediaEngine
-                            let api = APIBuilder::new()
-                                .with_media_engine(m)
-                                .with_interceptor_registry(registry)
-                                .build();
-
-                            // Prepare the configuration
-                            let config = RTCConfiguration {
-                                ice_servers: vec![RTCIceServer {
-                                    urls: vec!["stun:stun.l.google.com:19302".to_owned()],
-                                    ..Default::default()
-                                }],
-                                ..Default::default()
-                            };
-
-                            // Create a new RTCPeerConnection
-                            let peer_connection =
-                                Arc::new(api.new_peer_connection(config).await.unwrap());
-
-                            // Set the handler for Peer connection state
-                            // This will notify you when the peer has connected/disconnected
-                            peer_connection.on_peer_connection_state_change(Box::new(
-                                move |s: RTCPeerConnectionState| {
-                                    println!("Peer Connection State has changed: {s}");
-
-                                    if s == RTCPeerConnectionState::Failed {
-                                        // Wait until PeerConnection has had no network activity for 30 seconds or another failure. It may be reconnected using an ICE Restart.
-                                        // Use webrtc.PeerConnectionStateDisconnected if you are interested in detecting faster timeout.
-                                        // Note that the PeerConnection may come back from PeerConnectionStateDisconnected.
-                                        println!("Peer Connection has gone to failed exiting");
-                                    }
-
-                                    Box::pin(async {})
-                                },
-                            ));
-
-                            peer_connection.on_ice_candidate(Box::new(
-                                move |candidate: Option<RTCIceCandidate>| {
-                                    Box::pin(async move {
-                                        if let Some(c) = candidate {
-                                            println!(
-                                                "New ICE candidate: {}",
-                                                c.to_json().unwrap().candidate
-                                            );
-                                        } else {
-                                            println!("ICE gathering complete");
-                                        }
-                                    })
-                                },
-                            ));
-
-                            peer_connection.on_data_channel(Box::new(
-                                move |data_channel: Arc<RTCDataChannel>| {
-                                    println!(
-                                        "New DataChannel {}-{}",
-                                        data_channel.label(),
-                                        data_channel.id()
-                                    );
-                                    Box::pin(async move {})
-                                },
-                            ));
-
-                            let msg = websocket.read_message().expect("read message");
-                            let sdp_bytes = msg.into_text().expect("msg to text");
-                            let offer: RTCSessionDescription =
-                                serde_json::from_str(&sdp_bytes).expect("unmarshal SDP");
-                            println!("Received offer: {offer:?}");
-
-                            // Apply the offer as the remote description
-                            peer_connection.set_remote_description(offer).await.unwrap();
-
-                            // Create an answer to send to the browser
-                            let answer = peer_connection.create_answer(None).await.unwrap();
-
-                            // Sets the LocalDescription, and starts our UDP listeners
-                            peer_connection.set_local_description(answer).await.unwrap();
-
-                            // Create channel that is blocked until ICE Gathering is complete
-                            let mut gather_complete =
-                                peer_connection.gathering_complete_promise().await;
-
-                            // Block until ICE Gathering is complete, disabling trickle ICE
-                            // we do this because we only can exchange one signaling message
-                            // in a production application you should exchange ICE Candidates via OnICECandidate
-                            let _ = gather_complete.recv().await;
-
-                            println!("Connection established, waiting for messages...");
-
-                            PEER_CONNECTION.set(peer_connection).unwrap();
-                        }
-                        Err(e) => {
-                            eprintln!("websocket handshake failed: {e}");
-                            eprintln!(
-                                "Hint: Ensure your client connects with wss://localhost:8002 and trusts the local certificate in certs/."
-                            );
-                        }
-                    }
-                });
+    // receive single message from a client (we can either receive or send with socket).
+    // this will likely be the Pong for our Ping or a hello message from client.
+    // waiting for message from a client will block this task, but will not block other client's
+    // connections.
+    if let Some(msg) = socket.recv().await {
+        if let Ok(msg) = msg {
+            if process_message(msg, who).is_break() {
+                return;
             }
-            Err(e) => return Err(anyhow::anyhow!("TCP accept error: {e}")),
+        } else {
+            println!("client {who} abruptly disconnected");
+            return;
         }
     }
-    Ok(())
+
+    // Since each client gets individual statemachine, we can pause handling
+    // when necessary to wait for some external event (in this case illustrated by sleeping).
+    // Waiting for this client to finish getting its greetings does not prevent other clients from
+    // connecting to server and receiving their greetings.
+    for i in 1..5 {
+        if socket
+            .send(Message::Text(format!("Hi {i} times!").into()))
+            .await
+            .is_err()
+        {
+            println!("client {who} abruptly disconnected");
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+
+    // By splitting socket we can send and receive at the same time. In this example we will send
+    // unsolicited messages to client based on some sort of server's internal event (i.e .timer).
+    let (mut sender, mut receiver) = socket.split();
+
+    // Spawn a task that will push several messages to the client (does not matter what client does)
+    let mut send_task = tokio::spawn(async move {
+        let n_msg = 20;
+        for i in 0..n_msg {
+            // In case of any websocket error, we exit.
+            if sender
+                .send(Message::Text(format!("Server message {i} ...").into()))
+                .await
+                .is_err()
+            {
+                return i;
+            }
+
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        }
+
+        println!("Sending close to {who}...");
+        if let Err(e) = sender
+            .send(Message::Close(Some(CloseFrame {
+                code: axum::extract::ws::close_code::NORMAL,
+                reason: Utf8Bytes::from_static("Goodbye"),
+            })))
+            .await
+        {
+            println!("Could not send Close due to {e}, probably it is ok?");
+        }
+        n_msg
+    });
+
+    // This second task will receive messages from client and print them on server console
+    let mut recv_task = tokio::spawn(async move {
+        let mut cnt = 0;
+        while let Some(Ok(msg)) = receiver.next().await {
+            cnt += 1;
+            // print message and break if instructed to do so
+            if process_message(msg, who).is_break() {
+                break;
+            }
+        }
+        cnt
+    });
+
+    // If any one of the tasks exit, abort the other.
+    tokio::select! {
+        rv_a = (&mut send_task) => {
+            match rv_a {
+                Ok(a) => println!("{a} messages sent to {who}"),
+                Err(a) => println!("Error sending messages {a:?}")
+            }
+            recv_task.abort();
+        },
+        rv_b = (&mut recv_task) => {
+            match rv_b {
+                Ok(b) => println!("Received {b} messages"),
+                Err(b) => println!("Error receiving messages {b:?}")
+            }
+            send_task.abort();
+        }
+    }
+
+    // returning from the handler closes the websocket connection
+    println!("Websocket context {who} destroyed");
+}
+
+/// helper to print contents of messages to stdout. Has special treatment for Close.
+fn process_message(msg: Message, who: SocketAddr) -> ControlFlow<(), ()> {
+    match msg {
+        Message::Text(t) => {
+            println!(">>> {who} sent str: {t:?}");
+        }
+        Message::Binary(d) => {
+            println!(">>> {who} sent {} bytes: {d:?}", d.len());
+        }
+        Message::Close(c) => {
+            if let Some(cf) = c {
+                println!(
+                    ">>> {who} sent close with code {} and reason `{}`",
+                    cf.code, cf.reason
+                );
+            } else {
+                println!(">>> {who} somehow sent close message without CloseFrame");
+            }
+            return ControlFlow::Break(());
+        }
+
+        Message::Pong(v) => {
+            println!(">>> {who} sent pong with {v:?}");
+        }
+        // You should never need to manually handle Message::Ping, as axum's websocket library
+        // will do so for you automagically by replying with Pong and copying the v according to
+        // spec. But if you need the contents of the pings you can see them here.
+        Message::Ping(v) => {
+            println!(">>> {who} sent ping with {v:?}");
+        }
+    }
+    ControlFlow::Continue(())
 }
