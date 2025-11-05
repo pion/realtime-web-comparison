@@ -15,6 +15,23 @@
 //! ```not_rust
 //! cargo run -p example-websockets --bin example-client
 //! ```
+//! Example websocket server.
+//!
+//! Run the server with
+//! ```not_rust
+//! cargo run -p example-websockets --bin example-websockets
+//! ```
+//!
+//! Run a browser client with
+//! ```not_rust
+//! firefox http://localhost:3000
+//! ```
+//!
+//! Alternatively you can run the rust client (showing two
+//! concurrent websocket connections being established) with
+//! ```not_rust
+//! cargo run -p example-websockets --bin example-client
+//! ```
 
 use axum::{
     Router,
@@ -31,6 +48,7 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use webrtc::{
     api::{
         APIBuilder, interceptor_registry::register_default_interceptors, media_engine::MediaEngine,
+        setting_engine::SettingEngine,
     },
     data_channel::RTCDataChannel,
     ice_transport::{ice_candidate::RTCIceCandidate, ice_server::RTCIceServer},
@@ -156,11 +174,18 @@ async fn handle_socket(mut socket: WebSocket, who: SocketAddr) {
     // Register default codecs
     m.register_default_codecs().unwrap();
 
+    // Create a SettingEngine to configure network settings
+    let mut s = SettingEngine::default();
+    
+    // Include loopback candidates so the browser can connect via 127.0.0.1 when running locally
+    // This mirrors typical local testing behavior and avoids hairpin NAT issues on the same host
+    s.set_include_loopback_candidate(true);
+
     // Create a InterceptorRegistry. This is the user configurable RTP/RTCP Pipeline.
     // This provides NACKs, RTCP Reports and other features. If you use `webrtc.NewPeerConnection`
     // this is enabled by default. If you are manually managing You MUST create a InterceptorRegistry
     // for each PeerConnection.
-    let mut registry = interceptor::registry::Registry::new();
+    let mut registry = webrtc::interceptor::registry::Registry::new();
 
     // Use the default set of Interceptors
     registry = register_default_interceptors(registry, &mut m).unwrap();
@@ -169,9 +194,12 @@ async fn handle_socket(mut socket: WebSocket, who: SocketAddr) {
     let api = APIBuilder::new()
         .with_media_engine(m)
         .with_interceptor_registry(registry)
+        .with_setting_engine(s)
         .build();
 
     // Prepare the configuration
+    // When using ICE-Lite, we must not specify ICE servers (STUN/TURN)
+    // The client will perform all connectivity checks to our host candidates
     let config = RTCConfiguration {
         ice_servers: vec![RTCIceServer {
             urls: vec!["stun:stun.l.google.com:19302".to_owned()],
@@ -208,12 +236,38 @@ async fn handle_socket(mut socket: WebSocket, who: SocketAddr) {
         })
     }));
 
+    // Log ICE connection state transitions for deeper diagnostics
+    peer_connection.on_ice_connection_state_change(Box::new(move |s| {
+        println!("ICE Connection State changed: {:?}", s);
+        Box::pin(async {})
+    }));
+
+    // Add signaling state change handler
+    peer_connection.on_signaling_state_change(Box::new(move |s| {
+        println!("Signaling State changed: {:?}", s);
+        Box::pin(async {})
+    }));
+
     peer_connection.on_data_channel(Box::new(move |data_channel: Arc<RTCDataChannel>| {
-        println!(
-            "New DataChannel {}-{}",
-            data_channel.label(),
-            data_channel.id()
-        );
+        let d1 = Arc::clone(&data_channel);
+        let d2 = Arc::clone(&data_channel);
+        println!("Data channel '{}'-'{}' received from peer", data_channel.label(), data_channel.id());
+        d1.on_open(Box::new(move || {
+        println!("Data channel '{}'-'{}' open. Random messages will now be sent to any connected DataChannels every 5 seconds", data_channel.label(), data_channel.id());
+        Box::pin(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+            loop {
+                interval.tick().await;
+                let msg = String::from("Hello from webrtc-rs server!");
+                if d2.send_text(msg).await.is_ok() {
+                    println!("Sent message to DataChannel '{}'-'{}'", d2.label(), d2.id());
+                } else {
+                    println!("Failed to send message to DataChannel '{}'-'{}'", d2.label(), d2.id());
+                    break;
+                }
+            }
+        })
+    }));
         Box::pin(async move {})
     }));
 
@@ -243,9 +297,25 @@ async fn handle_socket(mut socket: WebSocket, who: SocketAddr) {
                 // in a production application you should exchange ICE Candidates via OnICECandidate
                 let _ = gather_complete.recv().await;
 
+                // Send the SDP answer back to the client before closing the websocket
+                if let Some(local) = pc.local_description().await {
+                    let answer_json = serde_json::to_string(&local).expect("marshal SDP answer");
+                    if socket.send(Message::Text(answer_json.into())).await.is_ok() {
+                        println!("Sent SDP answer to client");
+                    } else {
+                        println!("Failed to send SDP answer to client");
+                    }
+                } else {
+                    println!("No local description available to send as answer");
+                }
+
                 println!("Connection established, waiting for messages...");
 
-                PEER_CONNECTION.set(pc).unwrap();
+                PEER_CONNECTION.set(pc.clone()).unwrap();
+                
+                // Close the WebSocket after sending the answer, like the Go version
+                // The peer connection will stay alive via the global PEER_CONNECTION
+                drop(socket);
                 return;
             } else {
                 println!("Could not parse SDP from client {who}");
