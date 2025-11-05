@@ -20,3 +20,4 @@ tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 tracing = "0.1.41"
 axum-server = { version = "0.7.2", features = ["tls-rustls"] }
+bytes = { version = "1.10.1", features = ["serde"] }
