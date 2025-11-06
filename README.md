@@ -110,3 +110,5 @@ The `setup-certs` task will:
 ### Available Tasks
 
 - `nix run .#setup-certs` - Set up development certificates using mkcert
+
+Note: you might need to run `nix develop -c mkcert -install` and restart your browsers.
