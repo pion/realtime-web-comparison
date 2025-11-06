@@ -1,3 +1,13 @@
+# Nix
+result
+result-*
+
+# Rust
+target/
+**/*.rs.bk
+*.pdb
+debug/
+
 .idea/
 certs/
 *.pem
@@ -20,3 +30,12 @@ target
 
 # MSVC Windows builds of rustc generate these, which store debugging information
 *.pdb
+
+bin/
+vendor/
+node_modules/
+
+cover.out
+*.wasm
+
+*~

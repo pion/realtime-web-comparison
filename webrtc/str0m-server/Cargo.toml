@@ -1,0 +1,37 @@
+[package]
+name = "str0m-server"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.100"
+bytes = "1.10.1"
+crossbeam-channel = "0.5.15"
+futures-util = "0.3.31"
+if-addrs = "0.14.0"
+mimalloc = { version = "0.1", default-features = false }
+rustls = { version = "0.23.35", features = ["ring"] }
+rustls-pemfile = "2.2.0"
+rustls-pki-types = "1.13.0"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+socket2 = "0.6.1"
+tokio = { version = "1.48.0", features = ["macros", "net", "rt", "rt-multi-thread", "sync", "time"] }
+tokio-rustls = "0.26.4"
+tokio-tungstenite = { version = "0.28.0", features = ["tokio-rustls"] }
+
+[features]
+mimalloc = []
+
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62.2", features = ["Win32_Media_Multimedia"] }
+winapi = { version = "0.3", features = ["winbase", "winsock2", "ws2tcpip"] }
+tracing = { version = "0.1.41", features = ["async-await"] }
+tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
+
+[target.'cfg(not(target_os = "windows"))'.dependencies]
+str0m = { version = "0.11.1", default-features = false, features = ["openssl"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+str0m = { version = "0.11.1", default-features = false, features = ["wincrypto"] }
