@@ -607,10 +607,6 @@ fn try_write_messages(
                 }
 
                 backpressure_state.adjust_for_backpressure(written, had_error, batch_size);
-
-                if *message_index % 100 == 0 && written > 0 {
-                    eprintln!("Sent {} messages (batch: {}, bp: {})", message_index, written, backpressure_state.batch_size());
-                }
             }
         } else if *message_index == messages_to_send.len() && !messages_to_send.is_empty() {
             eprintln!("Finished sending all {} messages", messages_to_send.len());
