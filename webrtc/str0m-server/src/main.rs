@@ -6,7 +6,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-
+use socket2::SockRef;
 use crossbeam_channel as cb;
 use futures_util::{SinkExt, StreamExt};
 use if_addrs::get_if_addrs;
@@ -124,6 +124,63 @@ async fn handle_client(
     eprintln!("UDP bound to: {local_udp}");
 
     let std_udp = udp.into_std()?;
+
+    SockRef::from(&std_udp).set_send_buffer_size(20 * 1024 * 1024)?;
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawSocket;
+        use winapi::shared::minwindef::{DWORD, LPVOID};
+        use winapi::um::winsock2::{setsockopt, SO_SNDBUF, SOL_SOCKET, SOCKET_ERROR, WSAGetLastError, WSAIoctl};
+
+        // SIO_UDP_CONNRESET = _WSAIOW(IOC_VENDOR, 12) = 0x9800000C
+        const SIO_UDP_CONNRESET: DWORD = 0x9800000C;
+
+        let socket = std_udp.as_raw_socket();
+        let buffer_size: i32 = 40 * 1024 * 1024;
+        let result = unsafe {
+            setsockopt(
+                socket as _,
+                SOL_SOCKET,
+                SO_SNDBUF,
+                &buffer_size as *const _ as *const _,
+                std::mem::size_of::<i32>() as _,
+            )
+        };
+        if result == SOCKET_ERROR {
+            let err = unsafe { WSAGetLastError() };
+            eprintln!("Warning: Failed to set UDP send buffer size, error: {}", err);
+        } else {
+            eprintln!("Set UDP send buffer to {} bytes", buffer_size);
+        }
+
+        // disable spurious UDP connection reset errors on Windows
+        let mut bytes_returned: DWORD = 0;
+        let mut enable: u32 = 0;
+
+        let rc = unsafe {
+            WSAIoctl(
+                socket as _,
+                SIO_UDP_CONNRESET,
+                &mut enable as *mut _ as LPVOID,
+                std::mem::size_of::<u32>() as DWORD,
+                std::ptr::null_mut(),
+                0,
+                &mut bytes_returned as *mut _,
+                std::ptr::null_mut(),
+                None,
+            )
+        };
+        if rc == SOCKET_ERROR {
+            eprintln!("Warning: failed to set SIO_UDP_CONNRESET");
+        } else {
+            eprintln!("Disabled UDP connection reset errors (SIO_UDP_CONNRESET)");
+        }
+    }
+
+    let got = SockRef::from(&std_udp).send_buffer_size()?;
+    eprintln!("SO_SNDBUF set; effective size = {} bytes", got);
+
     let std_udp_arc = Arc::new(std_udp);
 
     let (ws_to_rtc_tx, ws_to_rtc_rx) = cb::unbounded::<WsInbound>();
@@ -413,12 +470,13 @@ fn run_rtc_thread(
     let answer_sdp = answer.to_sdp_string();
     eprintln!("SDP answer generated");
 
-    // Track data channel state for sending messages
     let mut channel_id: Option<str0m::channel::ChannelId> = None;
     let mut messages_to_send: Vec<String> = Vec::new();
     let mut message_index = 0;
+    let mut backpressure_state = BackpressureState::new();
 
-    let (mut next_deadline, _) = drain_outputs(&mut rtc, udp_socket.as_ref(), &mut channel_id, &mut messages_to_send, &mut message_index)?;
+
+    let (mut next_deadline, _) = drain_outputs(&mut rtc, udp_socket.as_ref(), &mut channel_id, &mut messages_to_send, &mut message_index, &mut backpressure_state)?;
     let _ = next_out.send(next_deadline);
 
     let _ = answer_out.send(answer_sdp);
@@ -460,13 +518,104 @@ fn run_rtc_thread(
             }
         }
 
-        let (nd, connected_state) = drain_outputs(&mut rtc, udp_socket.as_ref(), &mut channel_id, &mut messages_to_send, &mut message_index)?;
+        try_write_messages(&mut rtc, &channel_id, &messages_to_send, &mut message_index, &mut backpressure_state);
+
+        let (nd, _connected_state) = drain_outputs(&mut rtc, udp_socket.as_ref(), &mut channel_id, &mut messages_to_send, &mut message_index, &mut backpressure_state)?;
         if nd != next_deadline {
             next_deadline = nd;
             let _ = next_out.send(next_deadline);
         }
 
+        // Keep normal sleep time even when sending to avoid overwhelming Windows
         std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+struct BackpressureState {
+    consecutive_errors: usize,
+    successful_batches: usize,
+    current_batch_size: usize,
+}
+
+impl BackpressureState {
+    fn new() -> Self {
+        let initial = 5;
+        Self {
+            consecutive_errors: 0,
+            successful_batches: 0,
+            current_batch_size: initial,
+        }
+    }
+
+    fn adjust_for_backpressure(&mut self, written: usize, had_error: bool, batch_size: usize) {
+        if had_error {
+            self.consecutive_errors += 1;
+            self.successful_batches = 0;
+            self.current_batch_size = (self.current_batch_size / 2).max(1);
+        } else {
+            self.consecutive_errors = 0;
+            if written == batch_size && written > 0 {
+                self.successful_batches += 1;
+                if self.successful_batches >= 10 && self.current_batch_size < 20 {
+                    self.current_batch_size += 1;
+                    self.successful_batches = 0;
+                }
+            } else if written == 0 && batch_size > 1 {
+                self.current_batch_size = (self.current_batch_size * 2 / 3).max(1);
+            }
+        }
+    }
+
+    fn batch_size(&self) -> usize {
+        self.current_batch_size
+    }
+}
+
+fn try_write_messages(
+    rtc: &mut str0m::Rtc,
+    channel_id: &Option<str0m::channel::ChannelId>,
+    messages_to_send: &[String],
+    message_index: &mut usize,
+    backpressure_state: &mut BackpressureState,
+) {
+    if let Some(id) = *channel_id {
+        if *message_index < messages_to_send.len() {
+            if let Some(mut ch) = rtc.channel(id) {
+                let batch_size = backpressure_state.batch_size();
+                let mut written = 0;
+                let mut had_error = false;
+
+                while *message_index < messages_to_send.len() && written < batch_size {
+                    let message = &messages_to_send[*message_index];
+                    match ch.write(false, message.as_bytes()) {
+                        Ok(bytes_written) => {
+                            if bytes_written == 0 {
+                                had_error = true;
+                                break;
+                            }
+                            *message_index += 1;
+                            written += 1;
+                        }
+                        Err(e) => {
+                            if *message_index > 50 {
+                                eprintln!("Write error at message {}: {:?}", message_index, e);
+                            }
+                            had_error = true;
+                            break;
+                        }
+                    }
+                }
+
+                backpressure_state.adjust_for_backpressure(written, had_error, batch_size);
+
+                if *message_index % 100 == 0 && written > 0 {
+                    eprintln!("Sent {} messages (batch: {}, bp: {})", message_index, written, backpressure_state.batch_size());
+                }
+            }
+        } else if *message_index == messages_to_send.len() && !messages_to_send.is_empty() {
+            eprintln!("Finished sending all {} messages", messages_to_send.len());
+            *message_index += 1;
+        }
     }
 }
 
@@ -476,38 +625,22 @@ fn drain_outputs(
     channel_id: &mut Option<str0m::channel::ChannelId>,
     messages_to_send: &mut Vec<String>,
     message_index: &mut usize,
+    backpressure_state: &mut BackpressureState,
 ) -> anyhow::Result<(Instant, bool)> {
     let mut connected = false;
+    let mut next_timeout = None;
+    let mut output_count = 0;
+    const MAX_OUTPUTS_PER_CALL: usize = 10; // Process fewer outputs to avoid overwhelming
+
     loop {
         match rtc.poll_output()? {
             Output::Timeout(t) => {
-                // Try to send next message if channel is open and we have messages
-                if let Some(id) = *channel_id {
-                    if *message_index < messages_to_send.len() {
-                        // Get channel, write message, drop channel before continuing
-                        if let Some(mut ch) = rtc.channel(id) {
-                            let message = &messages_to_send[*message_index];
-                            match ch.write(false, message.as_bytes()) {
-                                Ok(_bytes) => {
-                                    *message_index += 1;
-                                    if *message_index % 100 == 0 {
-                                        eprintln!("Sent {} messages", message_index);
-                                    }
-                                }
-                                Err(e) => {
-                                    eprintln!("DataChannel write error (message {}): {e}", message_index);
-                                }
-                            }
-                        } else {
-                            // Channel not available - skip this message and try again next time
-                            eprintln!("Channel not available, skipping message {}", message_index);
-                        }
-                    } else if *message_index == messages_to_send.len() && !messages_to_send.is_empty() {
-                        eprintln!("Finished sending all {} messages", messages_to_send.len());
-                        *message_index += 1; // Prevent repeated logging
-                    }
+                next_timeout = Some(t);
+                try_write_messages(rtc, channel_id, messages_to_send, message_index, backpressure_state);
+                output_count += 1;
+                if output_count >= MAX_OUTPUTS_PER_CALL {
+                    break;
                 }
-                break Ok((t, connected));
             },
             Output::Transmit(tx) => {
                 if let Err(e) = udp_socket.send_to(&tx.contents, tx.destination) {
@@ -516,8 +649,13 @@ fn drain_outputs(
                     }
                     eprintln!("UDP send_to error to {}: {}", tx.destination, e);
                 }
+                output_count += 1;
+                if output_count >= MAX_OUTPUTS_PER_CALL {
+                    break;
+                }
             }
-            Output::Event(ev) => match &ev {
+            Output::Event(ev) => {
+                match &ev {
                 Event::IceConnectionStateChange(state) => eprintln!("ICE state: {state:?}"),
                 Event::Connected => {
                     eprintln!("WebRTC CONNECTED! ICE and DTLS established.");
@@ -553,9 +691,17 @@ fn drain_outputs(
                     *channel_id = None;
                 }
                 _ => {}
+                }
+                output_count += 1;
+                if output_count >= MAX_OUTPUTS_PER_CALL {
+                    break;
+                }
             },
         }
     }
+
+    let timeout = next_timeout.unwrap_or_else(|| Instant::now() + Duration::from_millis(10));
+    Ok((timeout, connected))
 }
 
 fn try_add_remote_candidate(rtc: &mut str0m::Rtc, candidate: &str, local_ip: IpAddr) {
