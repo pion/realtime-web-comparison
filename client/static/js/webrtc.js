@@ -21,11 +21,11 @@ webRTCBtn.onclick = (_) => {
     conn.onconnectionstatechange = () => {
         console.info(`WebRTC Connection State: ${conn.connectionState}`);
     };
-    
+
     conn.oniceconnectionstatechange = () => {
         console.info(`ICE Connection State: ${conn.iceConnectionState}`);
     };
-    
+
     conn.onicegatheringstatechange = () => {
         console.info(`ICE Gathering State: ${conn.iceGatheringState}`);
     };
@@ -61,14 +61,28 @@ webRTCBtn.onclick = (_) => {
         console.info(`WebRTC DataChannel established in ${new Date() - t0} ms.`);
     };
 
-    dataChannel.onmessage = (e) => {
+    dataChannel.onmessage = async (e) => {
         if (messageCount === 0) {
             webRTCBtn.disabled = true;
             t0 = new Date();
             chart.data.datasets[2].data.push({x: 0, y: 0});
         }
         messageCount += 1;
-        visualizePacket(decoder.decode(e.data));
+        let decoded;
+        if (typeof e.data === 'string') {
+            decoded = e.data;
+        } else if (e.data instanceof Blob) {
+            const buffer = await e.data.arrayBuffer();
+            decoded = decoder.decode(buffer);
+        } else if (e.data instanceof ArrayBuffer) {
+            decoded = decoder.decode(e.data);
+        } else if (e.data instanceof Uint8Array || e.data instanceof DataView) {
+            decoded = decoder.decode(e.data);
+        } else {
+            // fallback: try to convert to string
+            decoded = String(e.data);
+        }
+        visualizePacket(decoded);
         if (new Date() - t0 - chart.data.datasets[2].data.at(-1).x > 200) {
             chart.data.datasets[2].data.push({x: new Date() - t0, y: messageCount});
             chart.update();
