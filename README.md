@@ -25,6 +25,10 @@ for i := 10; i < 510; i += 10 {
 }
 ```
 
+## TODO
+- [Add more options for each network connection type](https://github.com/pion/realtime-web-comparison/issues/6)
+- Add more libraries to test.
+
 ## Dependencies
 - Server Sent Events
     - [tmaxmax/go-sse](https://github.com/tmaxmax/go-sse)
@@ -34,6 +38,7 @@ for i := 10; i < 510; i += 10 {
     - [snapview/tungstenite-rs](https://github.com/snapview/tungstenite-rs)
 - WebRTC
     - [pion/webrtc](https://github.com/pion/webrtc)
+    - [algesten/str0m](https://github.com/algesten/str0m)
 - WebTransport
     - [adriancable/webtransport-go](https://github.com/adriancable/webtransport-go)
 - Client is written in pure HTML/CSS/JS.
