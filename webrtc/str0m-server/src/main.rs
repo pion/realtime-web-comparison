@@ -17,8 +17,12 @@ use tokio_tungstenite::{accept_async, tungstenite::Message};
 use str0m::net::{Protocol, Receive};
 use str0m::{Candidate, Event, IceConnectionState, Input, Output};
 
+#[cfg(all(target_os = "windows", feature = "mimalloc"))]
+use mimalloc::MiMalloc;
+
+#[cfg(all(target_os = "windows", feature = "mimalloc"))]
 #[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+static GLOBAL: MiMalloc = MiMalloc;
 
 #[derive(Deserialize, Debug)]
 #[serde(tag = "type")]
@@ -314,9 +318,6 @@ fn run_rtc_blocking(
 
     let mut seen_ws_candidates = HashSet::<SocketAddr>::new();
 
-    // Optional: track a “selected” remote addr once we see inbound packets
-    let mut likely_selected_remote: Option<SocketAddr> = None;
-
     loop {
         // Drain str0m outputs until timeout
         let next_when = loop {
@@ -389,7 +390,6 @@ fn run_rtc_blocking(
         // drain UDP
         let mut fed_any = false;
         while let Ok(UdpIn { buf, src, dst }) = udp_in.try_recv() {
-            likely_selected_remote.get_or_insert(src);
             let input = Input::Receive(
                 Instant::now(),
                 Receive {
