@@ -77,14 +77,14 @@ struct TimerPeriodGuard;
 #[cfg(target_os = "windows")]
 impl TimerPeriodGuard {
     fn new_1ms() -> Self {
-        unsafe { windows_sys::Win32::Media::Multimedia::timeBeginPeriod(1); }
+        unsafe { windows::Win32::Media::timeBeginPeriod(1); }
         TimerPeriodGuard
     }
 }
 #[cfg(target_os = "windows")]
 impl Drop for TimerPeriodGuard {
     fn drop(&mut self) {
-        unsafe { windows_sys::Win32::Media::Multimedia::timeEndPeriod(1); }
+        unsafe { windows::Win32::Media::timeEndPeriod(1); }
     }
 }
 
