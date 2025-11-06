@@ -26,7 +26,7 @@ mimalloc = []
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62.2", features = ["Win32_Media_Multimedia"] }
-winapi = { version = "0.3", features = ["winbase"] }
+winapi = { version = "0.3", features = ["winbase", "winsock2", "ws2tcpip"] }
 tracing = { version = "0.1.41", features = ["async-await"] }
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
 
