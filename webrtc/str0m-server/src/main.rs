@@ -487,7 +487,16 @@ fn drain_outputs(rtc: &mut str0m::Rtc, udp_socket: &std::net::UdpSocket) -> anyh
                 Event::ChannelOpen(id, label) => {
                     eprintln!("DataChannel opened: id={id:?}, label={label}");
                     if let Some(mut ch) = rtc.channel(*id) {
-                        let _ = ch.write(true, b"hello from str0m on Windows+Linux");
+                        // Send message so we can test the server performance
+                            for i in (10..=510).step_by(10) {
+                                for j in (10..=510).step_by(10) {
+                                    let message = format!("{j},{i}");
+                                    if let Err(e) = ch.write(false, message.as_bytes()) {
+                                        eprintln!("DataChannel send error: {e}");
+                                    }
+                                    std::thread::sleep(std::time::Duration::from_millis(1));
+                                }
+                            }
                     }
                 }
                 Event::ChannelData(data) => eprintln!("DataChannel received: {data:?}"),
