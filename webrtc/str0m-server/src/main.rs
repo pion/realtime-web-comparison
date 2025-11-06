@@ -1,6 +1,7 @@
-// basic str0m implementation for testing purposes.
-// uses host candidates, expected to be used in a local network.
-// Should work on windows and linux.
+// str0m test server with a single tokio::select! loop (WS, UDP, timer)
+// should keeps the WebSocket/TLS flow unchanged as other clients. tested on Windows & Linux by.
+// doesn't work on firefox on windows (dtls handshake fails).
+use std::error::Error;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::Path;
 use std::sync::Arc;
@@ -8,21 +9,20 @@ use std::time::{Duration, Instant};
 
 use crossbeam_channel as cb;
 use futures_util::{SinkExt, StreamExt};
+use if_addrs::get_if_addrs;
+use mimalloc::MiMalloc;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use serde::{Deserialize, Serialize};
+use str0m::net::{Protocol, Receive};
+use str0m::{Candidate, Event, Input, Output};
 use tokio::net::{TcpListener, UdpSocket};
+use tokio::time::{sleep_until, Instant as TokioInstant};
 use tokio_rustls::{server::TlsStream, TlsAcceptor};
 use tokio_tungstenite::{accept_async, tungstenite::Message};
 
-use str0m::net::{Protocol, Receive};
-use str0m::{Candidate, Event, IceConnectionState, Input, Output};
-
-#[cfg(all(target_os = "windows", feature = "mimalloc"))]
-use mimalloc::MiMalloc;
-
-#[cfg(all(target_os = "windows", feature = "mimalloc"))]
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
+
 
 #[derive(Deserialize, Debug)]
 #[serde(tag = "type")]
@@ -61,51 +61,10 @@ enum WsOutbound {
     EndOfCandidates {},
 }
 
-#[derive(Debug)]
-struct UdpIn {
-    buf: Vec<u8>,
-    src: SocketAddr,
-    dst: SocketAddr,
-}
-
-#[cfg(target_os = "windows")]
-struct TimerPeriodGuard;
-#[cfg(target_os = "windows")]
-impl TimerPeriodGuard {
-    fn new_1ms() -> Self {
-        unsafe { windows::Win32::Media::timeBeginPeriod(1); }
-        TimerPeriodGuard
-    }
-}
-#[cfg(target_os = "windows")]
-impl Drop for TimerPeriodGuard {
-    fn drop(&mut self) {
-        unsafe { windows::Win32::Media::timeEndPeriod(1); }
-    }
-}
-
-// Enumerate non-loopback IPv4s
-fn enumerate_ipv4_non_loopback() -> Vec<Ipv4Addr> {
-    let mut v = Vec::new();
-    if let Ok(ifs) = if_addrs::get_if_addrs() {
-        for i in ifs {
-            if let IpAddr::V4(ip) = i.ip() {
-                if !ip.is_loopback() && !ip.is_link_local() {
-                    v.push(ip);
-                }
-            }
-        }
-    }
-    if v.is_empty() {
-        v.push(Ipv4Addr::UNSPECIFIED);
-    }
-    v
-}
-
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    #[cfg(target_os = "windows")]
-    let _timer_guard = TimerPeriodGuard::new_1ms();
+    rustls::crypto::CryptoProvider::install_default(rustls::crypto::ring::default_provider())
+        .map_err(|_| anyhow::anyhow!("Failed to install rustls ring provider"))?;
 
     let cert_path = Path::new("../../certs/localhost.pem");
     let key_path = Path::new("../../certs/localhost-key.pem");
@@ -128,293 +87,464 @@ async fn main() -> anyhow::Result<()> {
     eprintln!("Listening on wss://127.0.0.1:8002");
 
     loop {
-        let (tcp, peer_addr) = listener.accept().await?;
+        let (tcp, _) = listener.accept().await?;
         let acceptor = acceptor.clone();
 
-        let bind_ip = if peer_addr.ip().is_loopback() {
-            Ipv4Addr::LOCALHOST
-        } else {
-            enumerate_ipv4_non_loopback()
-                .into_iter()
-                .find(|ip| *ip != Ipv4Addr::UNSPECIFIED)
-                .unwrap_or(Ipv4Addr::LOCALHOST)
-        };
-
-        let udp = UdpSocket::bind(SocketAddr::new(IpAddr::V4(bind_ip), 0)).await?;
-        let local_udp = udp.local_addr()?;
-        eprintln!("UDP bound to: {}", local_udp);
-
-        let std_udp = udp.into_std()?;
-        let std_udp_arc = Arc::new(std_udp);
-
         tokio::spawn(async move {
-            if let Err(e) = handle_client(acceptor, tcp, std_udp_arc, local_udp).await {
-                eprintln!("client error: {e:?}");
+            if let Err(e) = handle_client(acceptor, tcp).await {
+                eprintln!("Client error: {e:?}");
             }
         });
     }
 }
 
+// This function handles one WebRTC connection from start to finish
 async fn handle_client(
     acceptor: TlsAcceptor,
     tcp: tokio::net::TcpStream,
-    std_udp_arc: Arc<std::net::UdpSocket>,
-    local_udp: SocketAddr,
 ) -> anyhow::Result<()> {
     let tls: TlsStream<_> = acceptor.accept(tcp).await?;
     let mut ws = accept_async(tls).await?;
 
-    // Expect initial offer
-    let first = ws.next().await.ok_or_else(|| anyhow::anyhow!("client closed"))??;
-    let offer = match first {
+    let first_msg = ws.next().await.ok_or_else(|| anyhow::anyhow!("client closed"))??;
+    let offer = match first_msg {
         Message::Text(t) => serde_json::from_str::<WsInbound>(&t)?,
         Message::Binary(b) => serde_json::from_slice::<WsInbound>(&b)?,
-        _ => anyhow::bail!("unexpected first WS frame"),
+        _ => anyhow::bail!("unexpected first WS message"),
     };
     let offer_sdp = match offer {
         WsInbound::Offer { sdp } => sdp,
-        _ => anyhow::bail!("first WS message must be an offer"),
+        _ => anyhow::bail!("first message must be an offer"),
     };
 
-    // Channels
+    let bind_ip = pick_bind_v4_for_offer(&offer_sdp);
+
+    let udp = UdpSocket::bind(SocketAddr::new(IpAddr::V4(bind_ip), 0)).await?;
+    let local_udp = udp.local_addr()?;
+    eprintln!("UDP bound to: {local_udp}");
+
+    let std_udp = udp.into_std()?;
+    let std_udp_arc = Arc::new(std_udp);
+
     let (ws_to_rtc_tx, ws_to_rtc_rx) = cb::unbounded::<WsInbound>();
     let (udp_to_rtc_tx, udp_to_rtc_rx) = cb::unbounded::<UdpIn>();
+    let (timeout_tx, timeout_rx) = cb::unbounded::<()>();
+    let (next_to_async_tx, next_to_async_rx) = cb::unbounded::<Instant>();
     let (answer_tx, answer_rx) = cb::unbounded::<String>();
 
-    // UDP receiver task
-    {
-        let std_udp_recv = Arc::clone(&std_udp_arc);
-        let local_udp_for_recv = local_udp;
-        tokio::spawn(async move {
-            let udp_recv =
-                tokio::net::UdpSocket::from_std(std_udp_recv.as_ref().try_clone().unwrap()).unwrap();
-            let mut buf = vec![0u8; 2000];
-            loop {
-                match udp_recv.recv_from(&mut buf).await {
-                    Ok((n, src)) => {
-                        let v = buf[..n].to_vec();
-                        let _ = udp_to_rtc_tx.send(UdpIn {
-                            buf: v,
-                            src,
-                            dst: local_udp_for_recv,
-                        });
-                    }
-                    Err(e) => {
-                        eprintln!("udp recv error: {e}");
-                        break;
-                    }
-                }
-            }
-        });
-    }
-
-    // Spawn RTC blocking worker; pass the arced socket so it can send directly (no extra send task)
-    let offer = offer_sdp.clone();
     let std_udp_for_rtc = Arc::clone(&std_udp_arc);
+    let offer_for_rtc = offer_sdp.clone();
     tokio::task::spawn_blocking(move || {
-        let _ = run_rtc_blocking(
-            offer,
-            local_udp.ip(),
+        let _ = run_rtc_thread(
+            offer_for_rtc,
+            IpAddr::V4(bind_ip),
             local_udp.port(),
             ws_to_rtc_rx,
             udp_to_rtc_rx,
-            std_udp_for_rtc, // <— direct sender
+            timeout_rx,
+            next_to_async_tx,
             answer_tx,
+            std_udp_for_rtc,
         );
     });
 
-    // Wait for answer
-    let answer = answer_rx.recv().unwrap();
+    let answer = tokio::task::spawn_blocking(move || answer_rx.recv()).await??;
 
-    // Send the SDP answer back to the client
     let answer_obj = serde_json::json!({ "type": "answer", "sdp": answer });
-    let _ = ws.send(Message::Text(serde_json::to_string(&answer_obj)?.into())).await;
+    ws.send(Message::Text(serde_json::to_string(&answer_obj)?.into()))
+        .await?;
 
-    let ws_to_rtc_tx_clone = ws_to_rtc_tx.clone();
-    let mut ws_read = ws;
-    tokio::spawn(async move {
-        while let Some(msg) = ws_read.next().await {
-            match msg {
-                Ok(Message::Text(t)) => {
-                    if let Ok(v) = serde_json::from_str::<WsInbound>(&t) {
-                        let _ = ws_to_rtc_tx_clone.send(v);
-                    }
-                }
-                Ok(Message::Binary(b)) => {
-                    if let Ok(v) = serde_json::from_slice::<WsInbound>(&b) {
-                        let _ = ws_to_rtc_tx_clone.send(v);
-                    }
-                }
-                Ok(Message::Close(_)) | Err(_) => break,
-                _ => {}
-            }
+    let udp_recv = {
+        let cloned = std_udp_arc.as_ref().try_clone()?;
+        tokio::net::UdpSocket::from_std(cloned)?
+    };
+
+    let mut buf = vec![0u8; 2048];
+    let local_addr_for_recv = SocketAddr::new(IpAddr::V4(bind_ip), local_udp.port());
+    let mut next_deadline = Instant::now() + Duration::from_millis(50);
+
+    loop {
+        if let Ok(t) = next_to_async_rx.try_recv() {
+            next_deadline = t;
         }
-    });
+
+        let mut ws_next = ws.next();
+        let sleep_fut = sleep_until(TokioInstant::from_std(next_deadline));
+        tokio::pin!(sleep_fut);
+
+        tokio::select! {
+            // ws candidates
+            maybe_msg = &mut ws_next => {
+                match maybe_msg {
+                    Some(Ok(Message::Text(t))) => {
+                        if let Ok(inb) = serde_json::from_str::<WsInbound>(&t) { let _ = ws_to_rtc_tx.send(inb); }
+                    }
+                    Some(Ok(Message::Binary(b))) => {
+                        if let Ok(inb) = serde_json::from_slice::<WsInbound>(&b) { let _ = ws_to_rtc_tx.send(inb); }
+                    }
+                    Some(Ok(Message::Close(_))) | None | Some(Err(_)) => { break; }
+                    _ => {}
+                }
+            }
+
+            // Handle incoming UDP packets (STUN, DTLS, media data)
+            recv = udp_recv.recv_from(&mut buf) => {
+                match recv {
+                    Ok((n, src)) => {
+                        if n > 0 {
+                            let data = buf[..n].to_vec();
+                            let _ = udp_to_rtc_tx.send(UdpIn { buf: data, src, dst: local_addr_for_recv });
+                        }
+                    }
+                    Err(e) => {
+                        if is_transient_udp_recv_err(&e) { /* ignore */ }
+                        else { eprintln!("UDP receive error (continuing): {e}"); }
+                    }
+                }
+            }
+
+            // Timer tick - tell str0m to check for timeouts
+            _ = &mut sleep_fut => { let _ = timeout_tx.send(()); }
+        }
+    }
 
     Ok(())
 }
 
-fn run_rtc_blocking(
+// Simple struct to hold information about incoming UDP packets
+#[derive(Debug)]
+struct UdpIn {
+    buf: Vec<u8>,
+    src: SocketAddr,
+    dst: SocketAddr,
+}
+
+// Check if a UDP receive error is something we can safely ignore
+// Windows has some quirks with UDP error handling
+fn is_transient_udp_recv_err(_e: &std::io::Error) -> bool {
+    #[cfg(windows)]
+    {
+        _e.kind() == std::io::ErrorKind::ConnectionReset || _e.raw_os_error() == Some(10054)
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+// Check if this is the weird EINVAL error that happens on Linux
+// when we try to send to a non-loopback address from a loopback-bound socket
+fn is_send_einval_to_non_loopback(e: &std::io::Error, dest: SocketAddr) -> bool {
+    if e.raw_os_error() == Some(22) {
+        if let IpAddr::V4(v4) = dest.ip() {
+            return !v4.is_loopback();
+        }
+    }
+    false
+}
+
+// Extract IPv4 addresses from the browser's SDP offer
+// We look for "a=candidate" lines and pull out the IP addresses
+// This helps us decide which network interface to bind to
+fn extract_offer_v4s(sdp: &str) -> Vec<Ipv4Addr> {
+    let mut ips = Vec::new();
+    for line in sdp.lines() {
+        // SDP candidate lines look like: a=candidate:1 1 UDP 12345 192.168.1.100 12345 typ host
+        if let Some(rest) = line.strip_prefix("a=candidate:") {
+            let parts: Vec<&str> = rest.split_whitespace().collect();
+            if parts.len() >= 6 {
+                // Skip mDNS hostnames (end with .local)
+                if !parts[4].ends_with(".local") {
+                    if let Ok(IpAddr::V4(v4)) = parts[4].parse::<IpAddr>() {
+                        ips.push(v4);
+                    }
+                }
+            }
+        }
+    }
+    ips
+}
+
+// Check how many bits two IP addresses share in common
+// This helps us find the best matching network interface
+fn same_lan_prefix(a: Ipv4Addr, b: Ipv4Addr) -> u32 {
+    let ao = a.octets();
+    let bo = b.octets();
+    if ao == bo {
+        return 32; // Exact match
+    }
+    if ao[0] == bo[0] && ao[1] == bo[1] && ao[2] == bo[2] {
+        return 24; // Same /24 subnet
+    }
+    if ao[0] == bo[0] && ao[1] == bo[1] {
+        return 16; // Same /16 subnet
+    }
+    if ao[0] == bo[0] {
+        return 8;  // Same /8 subnet
+    }
+    0  // No common prefix
+}
+
+// Check if a network interface name suggests it's a virtual/tunnel interface
+// We prefer real network interfaces for WebRTC connections
+fn if_is_virtual(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    [
+        "virtualbox",
+        "vmware",
+        "hyper-v",
+        "wintun",
+        "tailscale",
+        "zerotier",
+        "docker",
+        "vbox",
+        "bridge",
+        "hamachi",
+        "loopback",
+        "veth",
+    ]
+    .iter()
+    .any(|k| n.contains(k))
+}
+
+fn pick_bind_v4_for_offer(offer_sdp: &str) -> Ipv4Addr {
+    if let Ok(s) = std::env::var("BIND_UDP_IP") {
+        if let Ok(ip) = s.parse::<Ipv4Addr>() {
+            return ip;
+        }
+    }
+
+    let offer_ips = extract_offer_v4s(offer_sdp);
+    if offer_ips.iter().any(|ip| ip.is_loopback()) {
+        return Ipv4Addr::LOCALHOST;
+    }
+
+    let mut best: Option<(u32, Ipv4Addr)> = None;
+    if let Ok(ifs) = get_if_addrs() {
+        for i in &ifs {
+            if let IpAddr::V4(ip) = i.ip() {
+                if i.is_loopback() || ip.is_loopback() {
+                    continue;
+                }
+                if if_is_virtual(&i.name) {
+                    continue;
+                }
+                let o = ip.octets();
+                let is_rfc1918 = (o[0] == 10)
+                    || (o[0] == 172 && (16..=31).contains(&o[1]))
+                    || (o[0] == 192 && o[1] == 168);
+                if !is_rfc1918 {
+                    continue;
+                }
+                let mut rank = 0;
+                for off in &offer_ips {
+                    rank = rank.max(same_lan_prefix(ip, *off));
+                }
+                if best.as_ref().map_or(true, |(r, _)| rank > *r) {
+                    best = Some((rank, ip));
+                }
+            }
+        }
+        if let Some((_, ip)) = best {
+            return ip;
+        }
+
+        for i in ifs {
+            if let IpAddr::V4(ip) = i.ip() {
+                if i.is_loopback() || ip.is_loopback() {
+                    continue;
+                }
+                if if_is_virtual(&i.name) {
+                    continue;
+                }
+                let o = ip.octets();
+                let is_rfc1918 = (o[0] == 10)
+                    || (o[0] == 172 && (16..=31).contains(&o[1]))
+                    || (o[0] == 192 && o[1] == 168);
+                if is_rfc1918 {
+                    return ip;
+                }
+            }
+        }
+    }
+
+    Ipv4Addr::LOCALHOST
+}
+
+fn run_rtc_thread(
     offer_sdp: String,
     local_ip: IpAddr,
     udp_port: u16,
     ws_in: cb::Receiver<WsInbound>,
     udp_in: cb::Receiver<UdpIn>,
-    udp_sock: Arc<std::net::UdpSocket>, // <— direct sender
-    answer_tx: cb::Sender<String>,
+    timeout_in: cb::Receiver<()>,
+    next_out: cb::Sender<Instant>,
+    answer_out: cb::Sender<String>,
+    udp_socket: Arc<std::net::UdpSocket>,
 ) -> anyhow::Result<()> {
-    use std::collections::HashSet;
-    let cert_options = str0m::config::DtlsCertOptions {
-        pkey_type: str0m::config::DtlsPKeyType::EcDsaP256,
-        ..Default::default()
+    let mut rtc = {
+        #[cfg(windows)]
+        {
+            // trying to fix it for firefox on windows?
+            let cert_opts = str0m::config::DtlsCertOptions {
+                pkey_type: str0m::config::DtlsPKeyType::Rsa2048,
+                ..Default::default()
+            };
+            let crypto_provider = str0m::config::CryptoProvider::WinCrypto;
+            let dtls_cert = str0m::config::DtlsCert::new(crypto_provider, cert_opts);
+            let str0m_config = str0m::RtcConfig::new()
+                .set_dtls_cert_config(str0m::DtlsCertConfig::PregeneratedCert(dtls_cert));
+            str0m_config.build()
+        }
+        #[cfg(not(windows))]
+        {
+            str0m::RtcConfig::new().build()
+        }
     };
-    let crypto_provider = if cfg!(windows) {
-        str0m::config::CryptoProvider::WinCrypto
-    } else {
-        str0m::config::CryptoProvider::OpenSsl
-    };
-    let dtls_cert = str0m::config::DtlsCert::new(crypto_provider, cert_options);
-    let str0m_config = str0m::RtcConfig::new()
-        .set_dtls_cert_config(str0m::DtlsCertConfig::PregeneratedCert(dtls_cert));
-
-    let mut rtc = str0m_config.build();
 
     let local_addr = SocketAddr::new(local_ip, udp_port);
-    let localhost_cand = Candidate::host(local_addr, "udp")?;
-    rtc
-        .add_local_candidate(localhost_cand)
-        .ok_or_else(|| anyhow::anyhow!("failed to add local candidate"))?;
+    let local_candidate = Candidate::host(local_addr, "udp")?;
+    rtc.add_local_candidate(local_candidate)
+        .ok_or(anyhow::anyhow!("Failed to add local candidate"))?;
     eprintln!("Added local candidate: {local_addr}");
 
     let offer = str0m::change::SdpOffer::from_sdp_string(&offer_sdp)?;
-
-    let answer = rtc.sdp_api().accept_offer(offer)?.to_sdp_string();
+    let answer = rtc.sdp_api().accept_offer(offer)?;
+    let answer_sdp = answer.to_sdp_string();
     eprintln!("SDP answer generated");
 
+    let (mut next_deadline, _) = drain_outputs(&mut rtc, udp_socket.as_ref())?;
+    let _ = next_out.send(next_deadline);
+
+    let _ = answer_out.send(answer_sdp);
+
+    loop {
+        while let Ok(ws_msg) = ws_in.try_recv() {
+            match ws_msg {
+                WsInbound::Candidate { candidate, .. } => {
+                    try_add_remote_candidate(&mut rtc, &candidate, local_ip)
+                }
+                WsInbound::EndOfCandidates { .. } => eprintln!("EndOfCandidates received"),
+                _ => {}
+            }
+        }
+        // Drain inbound UDP
+        while let Ok(UdpIn { buf, src, dst }) = udp_in.try_recv() {
+            let contents: &[u8] = &buf;
+            if let Ok(contents_slice) = contents.try_into() {
+                let input = Input::Receive(
+                    Instant::now(),
+                    Receive {
+                        proto: Protocol::Udp,
+                        source: src,
+                        destination: dst,
+                        contents: contents_slice,
+                    },
+                );
+                if let Err(e) = rtc.handle_input(input) {
+                    eprintln!("Error handling UDP input: {e:?}");
+                    if let Some(source) = e.source() {
+                        eprintln!("  Source: {source:?}");
+                    }
+                }
+            }
+        }
+        while let Ok(()) = timeout_in.try_recv() {
+            if let Err(e) = rtc.handle_input(Input::Timeout(Instant::now())) {
+                eprintln!("Error handling timeout: {e}");
+            }
+        }
+
+        let (nd, _) = drain_outputs(&mut rtc, udp_socket.as_ref())?;
+        if nd != next_deadline {
+            next_deadline = nd;
+            let _ = next_out.send(next_deadline);
+        }
+
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+fn drain_outputs(rtc: &mut str0m::Rtc, udp_socket: &std::net::UdpSocket) -> anyhow::Result<(Instant, bool)> {
+    let mut connected = false;
     loop {
         match rtc.poll_output()? {
-            Output::Timeout(when) => {
-                let now = Instant::now();
-                if now >= when {
-                    rtc.handle_input(Input::Timeout(now))?;
-                } else {
-                    break;
-                }
-            }
+            Output::Timeout(t) => break Ok((t, connected)),
             Output::Transmit(tx) => {
-                // Send directly on the arced socket
-                let _ = udp_sock.send_to(&tx.contents, tx.destination);
-            }
-            Output::Event(ev) => {
-                if let Event::IceConnectionStateChange(st) = &ev {
-                    eprintln!("ICE state after accept: {st:?}");
+                if let Err(e) = udp_socket.send_to(&tx.contents, tx.destination) {
+                    if is_send_einval_to_non_loopback(&e, tx.destination) {
+                        continue;
+                    }
+                    eprintln!("UDP send_to error to {}: {}", tx.destination, e);
                 }
+            }
+            Output::Event(ev) => match &ev {
+                Event::IceConnectionStateChange(state) => eprintln!("ICE state: {state:?}"),
+                Event::Connected => {
+                    eprintln!("WebRTC CONNECTED! ICE and DTLS established.");
+                    connected = true;
+                }
+                Event::ChannelOpen(id, label) => {
+                    eprintln!("DataChannel opened: id={id:?}, label={label}");
+                    if let Some(mut ch) = rtc.channel(*id) {
+                        let _ = ch.write(true, b"hello from str0m on Windows+Linux");
+                    }
+                }
+                Event::ChannelData(data) => eprintln!("DataChannel received: {data:?}"),
+                Event::ChannelClose(id) => eprintln!("DataChannel closed: id={id:?}"),
+                _ => {}
+            },
+        }
+    }
+}
+
+fn try_add_remote_candidate(rtc: &mut str0m::Rtc, candidate: &str, local_ip: IpAddr) {
+    let line = candidate.trim_start_matches("a=").trim_start_matches("candidate:");
+    let parts: Vec<&str> = line.split_whitespace().collect();
+    if parts.len() < 6 {
+        return;
+    }
+    if !parts
+        .get(2)
+        .map(|s| s.eq_ignore_ascii_case("udp"))
+        .unwrap_or(false)
+    {
+        return;
+    }
+
+    // ignore mDNS hostnames.
+    if parts[4].ends_with(".local") {
+        return;
+    }
+
+    let ip = match parts.get(4).and_then(|s| s.parse::<IpAddr>().ok()) {
+        Some(IpAddr::V4(v4)) => v4,
+        _ => return,
+    };
+    let port = match parts.get(5).and_then(|s| s.parse::<u16>().ok()) {
+        Some(p) => p,
+        None => return,
+    };
+
+    match local_ip {
+        IpAddr::V4(v4) if v4.is_loopback() => {
+            if !ip.is_loopback() {
+                return;
+            }
+        }
+        _ => {
+            let o = ip.octets();
+            let is_rfc1918 = (o[0] == 10)
+                || (o[0] == 172 && (16..=31).contains(&o[1]))
+                || (o[0] == 192 && o[1] == 168);
+            if !(is_rfc1918 || ip.is_loopback()) {
+                return;
             }
         }
     }
 
-    // Provide answer to WS task
-    let _ = answer_tx.send(answer);
-
-    let mut seen_ws_candidates = HashSet::<SocketAddr>::new();
-
-    loop {
-        // Drain str0m outputs until timeout
-        let next_when = loop {
-            match rtc.poll_output()? {
-                Output::Timeout(when) => break when,
-                Output::Transmit(tx) => {
-                    // During early ICE, sends to “other” pairs can legitimately fail on Windows.
-                    // We best-effort send and ignore OS error 10051 noise.
-                    let _ = udp_sock.send_to(&tx.contents, tx.destination);
-                }
-                Output::Event(ev) => {
-                    match &ev {
-                        Event::Connected => {
-                            eprintln!("WebRTC CONNECTED! ICE and DTLS established.");
-                        }
-                        Event::IceConnectionStateChange(state) => {
-                            eprintln!("ICE state changed: {state:?}");
-                            if matches!(state, IceConnectionState::Disconnected) {
-                                eprintln!("ICE DISCONNECTED - stopping.");
-                                return Ok(());
-                            }
-                        }
-                        Event::ChannelOpen(id, label) => {
-                            eprintln!("DataChannel opened: id={id:?}, label={label}");
-                            if let Some(mut ch) = rtc.channel(*id) {
-                                // send a couple of probes
-                                for i in 0..5 {
-                                    let _ = ch.write(true, format!("hi {i}").as_bytes());
-                                }
-                            }
-                        }
-                        Event::ChannelData(data) => {
-                            eprintln!("DataChannel received {} bytes", data.data.len());
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        };
-
-        // drain WS
-        while let Ok(msg) = ws_in.try_recv() {
-            match msg {
-                WsInbound::Candidate { candidate, .. } => {
-                    let candidate_line = candidate
-                        .strip_prefix("a=")
-                        .or_else(|| candidate.strip_prefix("candidate:"))
-                        .unwrap_or(&candidate);
-                    let parts: Vec<&str> = candidate_line.split_whitespace().collect();
-                    if parts.len() >= 8 && parts[2].eq_ignore_ascii_case("udp") {
-                        if let (Ok(ip), Ok(port)) =
-                            (parts[4].parse::<IpAddr>(), parts[5].parse::<u16>())
-                        {
-                            if !ip.is_unspecified() {
-                                let addr = SocketAddr::new(ip, port);
-                                if seen_ws_candidates.insert(addr) {
-                                    if let Ok(c) = Candidate::host(addr, "udp") {
-                                        let _ = rtc.add_remote_candidate(c);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                WsInbound::EndOfCandidates {} => { }
-                WsInbound::Offer { .. } => { }
-            }
-        }
-
-        // drain UDP
-        let mut fed_any = false;
-        while let Ok(UdpIn { buf, src, dst }) = udp_in.try_recv() {
-            let input = Input::Receive(
-                Instant::now(),
-                Receive {
-                    proto: Protocol::Udp,
-                    source: src,
-                    destination: dst,
-                    contents: buf.as_slice().try_into().unwrap(),
-                },
-            );
-            rtc.handle_input(input)?;
-            fed_any = true;
-        }
-        if fed_any {
-            // after receive bursts, we may get immediate outputs?
-            continue;
-        }
-
-        // wait/sleep until next timeout
-        let now = Instant::now();
-        if now >= next_when {
-            rtc.handle_input(Input::Timeout(now))?;
-        } else {
-            let sleep = (next_when - now).min(Duration::from_millis(1));
-            std::thread::sleep(sleep);
-            rtc.handle_input(Input::Timeout(Instant::now()))?;
-        }
+    let addr = SocketAddr::new(IpAddr::V4(ip), port);
+    if let Ok(c) = Candidate::host(addr, "udp") {
+        rtc.add_remote_candidate(c);
     }
 }

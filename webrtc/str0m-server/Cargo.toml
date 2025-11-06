@@ -10,7 +10,7 @@ crossbeam-channel = "0.5.15"
 futures-util = "0.3.31"
 if-addrs = "0.14.0"
 mimalloc = { version = "0.1", default-features = false }
-rustls = "0.23.35"
+rustls = { version = "0.23.35", features = ["ring"] }
 rustls-pemfile = "2.2.0"
 rustls-pki-types = "1.13.0"
 serde = { version = "1.0.228", features = ["derive"] }
