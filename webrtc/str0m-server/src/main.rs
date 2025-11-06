@@ -16,13 +16,6 @@ use tungstenite::{accept, buffer};
 
 /// A WebSocket echo server over TLS (wss://)
 fn main() {
-    // Select crypto backend explicitly (required by str0m on Windows).
-    // Safe to call once at process start; will panic if called twice.
-    #[cfg(windows)]
-    {
-        CryptoProvider::WinCrypto.install_process_default();
-    }
-
     // Use fixed relative paths from this crate to the repo certs
     let cert_path = Path::new("../../certs/localhost.pem");
     let key_path = Path::new("../../certs/localhost-key.pem");
