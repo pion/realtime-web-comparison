@@ -6,8 +6,8 @@ use std::thread::spawn;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::{ServerConfig, ServerConnection, StreamOwned};
-use str0m::Rtc;
 use str0m::change::SdpOffer;
+use str0m::{Candidate, Rtc};
 use tungstenite::accept;
 
 /// A WebSocket echo server over TLS (wss://)
@@ -56,20 +56,25 @@ fn main() {
                             if let Ok(msg) = websocket.read() {
                                 eprintln!("Received message: {}", msg);
                                 // create RTC client
-                                let offer: SdpOffer =
-                                    serde_json::from_slice(&msg.into_data()).expect("serialized offer");
-                                let mut rtc = Rtc::builder()
-                                    // Uncomment this to see statistics
-                                    // .set_stats_interval(Some(Duration::from_secs(1)))
-                                    // .set_ice_lite(true)
-                                    .build();
+                                let offer: SdpOffer = serde_json::from_slice(&msg.into_data())
+                                    .expect("serialized offer");
+                                let cert_options = str0m::config::DtlsCertOptions {
+                                    pkey_type: str0m::config::DtlsPKeyType::EcDsaP256,
+                                    ..Default::default()
+                                };
+                                let crypto_provider = if cfg!(windows) {
+                                    str0m::config::CryptoProvider::WinCrypto
+                                } else {
+                                    str0m::config::CryptoProvider::OpenSsl
+                                };
+                                let dtls_cert =
+                                    str0m::config::DtlsCert::new(crypto_provider, cert_options);
 
-                                // Add the shared UDP socket as a host candidate
-                                /*
-                                let candidate =
-                                    Candidate::host(addr, "udp").expect("a host candidate");
-                                rtc.add_local_candidate(candidate).unwrap();
-                                */
+                                let str0m_config = str0m::RtcConfig::new().set_dtls_cert_config(
+                                    str0m::DtlsCertConfig::PregeneratedCert(dtls_cert),
+                                );
+
+                                let mut rtc = str0m_config.build();
 
                                 // Create an SDP Answer.
                                 let answer = rtc
@@ -77,7 +82,11 @@ fn main() {
                                     .accept_offer(offer)
                                     .expect("offer to be accepted");
 
-                                websocket.write(answer.to_sdp_string().into()).expect("send answer");
+                                websocket
+                                    .write(answer.to_sdp_string().into())
+                                    .expect("send answer");
+
+                                eprintln!("Sent SDP answer");
                             } else {
                                 eprintln!("Client disconnected");
                                 break;
