@@ -413,7 +413,12 @@ fn run_rtc_thread(
     let answer_sdp = answer.to_sdp_string();
     eprintln!("SDP answer generated");
 
-    let (mut next_deadline, _) = drain_outputs(&mut rtc, udp_socket.as_ref())?;
+    // Track data channel state for sending messages
+    let mut channel_id: Option<str0m::channel::ChannelId> = None;
+    let mut messages_to_send: Vec<String> = Vec::new();
+    let mut message_index = 0;
+
+    let (mut next_deadline, _) = drain_outputs(&mut rtc, udp_socket.as_ref(), &mut channel_id, &mut messages_to_send, &mut message_index)?;
     let _ = next_out.send(next_deadline);
 
     let _ = answer_out.send(answer_sdp);
@@ -455,7 +460,7 @@ fn run_rtc_thread(
             }
         }
 
-        let (nd, _) = drain_outputs(&mut rtc, udp_socket.as_ref())?;
+        let (nd, connected_state) = drain_outputs(&mut rtc, udp_socket.as_ref(), &mut channel_id, &mut messages_to_send, &mut message_index)?;
         if nd != next_deadline {
             next_deadline = nd;
             let _ = next_out.send(next_deadline);
@@ -465,11 +470,45 @@ fn run_rtc_thread(
     }
 }
 
-fn drain_outputs(rtc: &mut str0m::Rtc, udp_socket: &std::net::UdpSocket) -> anyhow::Result<(Instant, bool)> {
+fn drain_outputs(
+    rtc: &mut str0m::Rtc,
+    udp_socket: &std::net::UdpSocket,
+    channel_id: &mut Option<str0m::channel::ChannelId>,
+    messages_to_send: &mut Vec<String>,
+    message_index: &mut usize,
+) -> anyhow::Result<(Instant, bool)> {
     let mut connected = false;
     loop {
         match rtc.poll_output()? {
-            Output::Timeout(t) => break Ok((t, connected)),
+            Output::Timeout(t) => {
+                // Try to send next message if channel is open and we have messages
+                if let Some(id) = *channel_id {
+                    if *message_index < messages_to_send.len() {
+                        // Get channel, write message, drop channel before continuing
+                        if let Some(mut ch) = rtc.channel(id) {
+                            let message = &messages_to_send[*message_index];
+                            match ch.write(false, message.as_bytes()) {
+                                Ok(_bytes) => {
+                                    *message_index += 1;
+                                    if *message_index % 100 == 0 {
+                                        eprintln!("Sent {} messages", message_index);
+                                    }
+                                }
+                                Err(e) => {
+                                    eprintln!("DataChannel write error (message {}): {e}", message_index);
+                                }
+                            }
+                        } else {
+                            // Channel not available - skip this message and try again next time
+                            eprintln!("Channel not available, skipping message {}", message_index);
+                        }
+                    } else if *message_index == messages_to_send.len() && !messages_to_send.is_empty() {
+                        eprintln!("Finished sending all {} messages", messages_to_send.len());
+                        *message_index += 1; // Prevent repeated logging
+                    }
+                }
+                break Ok((t, connected));
+            },
             Output::Transmit(tx) => {
                 if let Err(e) = udp_socket.send_to(&tx.contents, tx.destination) {
                     if is_send_einval_to_non_loopback(&e, tx.destination) {
@@ -486,21 +525,33 @@ fn drain_outputs(rtc: &mut str0m::Rtc, udp_socket: &std::net::UdpSocket) -> anyh
                 }
                 Event::ChannelOpen(id, label) => {
                     eprintln!("DataChannel opened: id={id:?}, label={label}");
-                    if let Some(mut ch) = rtc.channel(*id) {
+                    if !connected {
+                        eprintln!("Warning: Channel opened but connection not yet established");
+                    }
+                    *channel_id = Some(*id);
+                    // Generate all messages to send (they will be sent one at a time in the Timeout handler)
+                    if messages_to_send.is_empty() {
+                        eprintln!("Starting to send messages through data channel");
                         // Send message so we can test the server performance
+                        // Write messages and continue polling to ensure they're sent
+                        // This is critical on Windows where writes are buffered
+                        // Queue messages instead of writing them all at once
+                        if messages_to_send.is_empty() {
+                            eprintln!("Generating messages to send");
                             for i in (10..=510).step_by(10) {
                                 for j in (10..=510).step_by(10) {
-                                    let message = format!("{j},{i}");
-                                    if let Err(e) = ch.write(false, message.as_bytes()) {
-                                        eprintln!("DataChannel send error: {e}");
-                                    }
-                                    std::thread::sleep(std::time::Duration::from_millis(1));
+                                    messages_to_send.push(format!("{j},{i}"));
                                 }
                             }
+                            eprintln!("Generated {} messages to send", messages_to_send.len());
+                        }
                     }
                 }
                 Event::ChannelData(data) => eprintln!("DataChannel received: {data:?}"),
-                Event::ChannelClose(id) => eprintln!("DataChannel closed: id={id:?}"),
+                Event::ChannelClose(id) => {
+                    eprintln!("DataChannel closed: id={id:?}");
+                    *channel_id = None;
+                }
                 _ => {}
             },
         }
