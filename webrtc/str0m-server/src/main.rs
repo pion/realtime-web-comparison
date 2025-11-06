@@ -1,17 +1,28 @@
-use std::net::TcpListener;
+use std::io::ErrorKind;
+use std::net::{TcpListener, UdpSocket};
 use std::path::Path;
 use std::sync::Arc;
 use std::thread::spawn;
+use std::time::{Duration, Instant};
 
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::{ServerConfig, ServerConnection, StreamOwned};
 use str0m::change::SdpOffer;
-use str0m::{Candidate, Rtc};
-use tungstenite::accept;
+use str0m::config::CryptoProvider;
+use str0m::net::{Protocol, Receive};
+use str0m::{Candidate, Event, IceConnectionState, Input, Output, Rtc};
+use tungstenite::{accept, buffer};
 
 /// A WebSocket echo server over TLS (wss://)
 fn main() {
+    // Select crypto backend explicitly (required by str0m on Windows).
+    // Safe to call once at process start; will panic if called twice.
+    #[cfg(windows)]
+    {
+        CryptoProvider::WinCrypto.install_process_default();
+    }
+
     // Use fixed relative paths from this crate to the repo certs
     let cert_path = Path::new("../../certs/localhost.pem");
     let key_path = Path::new("../../certs/localhost-key.pem");
@@ -55,9 +66,17 @@ fn main() {
                         Ok(mut websocket) => loop {
                             if let Ok(msg) = websocket.read() {
                                 eprintln!("Received message: {}", msg);
-                                // create RTC client
+
+                                // Parse remote SDP offer.
                                 let offer: SdpOffer = serde_json::from_slice(&msg.into_data())
                                     .expect("serialized offer");
+
+                                // Prepare UDP socket to carry ICE/DTLS/SCTP traffic.
+                                let udp = UdpSocket::bind("0.0.0.0:0").expect("bind UDP");
+                                let local_addr = udp.local_addr().expect("local addr");
+                                eprintln!("UDP bound on {}", local_addr);
+
+                                // Build Rtc instance.
                                 let cert_options = str0m::config::DtlsCertOptions {
                                     pkey_type: str0m::config::DtlsPKeyType::EcDsaP256,
                                     ..Default::default()
@@ -76,17 +95,92 @@ fn main() {
 
                                 let mut rtc = str0m_config.build();
 
-                                // Create an SDP Answer.
+                                // Accept offer and create answer.
                                 let answer = rtc
                                     .sdp_api()
                                     .accept_offer(offer)
                                     .expect("offer to be accepted");
 
+                                // Send SDP answer back to the client.
                                 websocket
                                     .write(answer.to_sdp_string().into())
                                     .expect("send answer");
-
                                 eprintln!("Sent SDP answer");
+
+                                let socket = udp;
+                                let buffer_size = 2000;
+                                let mut buf = vec![0u8; buffer_size];
+                                loop {
+                                    // Poll outputs until timeout is returned.
+                                    let timeout_instant = loop {
+                                        match rtc.poll_output().expect("poll output") {
+                                            Output::Timeout(when) => break when,
+                                            Output::Transmit(tx) => {
+                                                let _ =
+                                                    socket.send_to(&tx.contents, tx.destination);
+                                            }
+                                            Output::Event(ev) => {
+                                                eprintln!("RTC event: {:?}", ev);
+                                                if let Event::IceConnectionStateChange(state) = ev {
+                                                    if state == IceConnectionState::Disconnected {
+                                                        eprintln!("ICE disconnected");
+                                                        return;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    };
+
+                                    // Compute duration until timeout.
+                                    let now = Instant::now();
+                                    let duration = if timeout_instant > now {
+                                        timeout_instant - now
+                                    } else {
+                                        Duration::from_millis(0)
+                                    };
+
+                                    if duration.is_zero() {
+                                        // Drive timers immediately.
+                                        rtc.handle_input(Input::Timeout(Instant::now()))
+                                            .expect("timeout input");
+                                        continue;
+                                    }
+
+                                    // run RTC input
+                                    let _ = socket.set_read_timeout(Some(duration));
+                                    buf.resize(buffer_size, 0);
+                                    match socket.recv_from(&mut buf) {
+                                        Ok((n, src)) => {
+                                            buf.truncate(n);
+                                            let input = Input::Receive(
+                                                Instant::now(),
+                                                Receive {
+                                                    proto: Protocol::Udp,
+                                                    source: src,
+                                                    destination: socket
+                                                        .local_addr()
+                                                        .expect("local addr"),
+                                                    contents: buf
+                                                        .as_slice()
+                                                        .try_into()
+                                                        .expect("slice"),
+                                                },
+                                            );
+                                            rtc.handle_input(input).expect("handle input");
+                                        }
+                                        Err(e)
+                                            if e.kind() == ErrorKind::WouldBlock
+                                                || e.kind() == ErrorKind::TimedOut =>
+                                        {
+                                            rtc.handle_input(Input::Timeout(Instant::now()))
+                                                .expect("timeout input");
+                                        }
+                                        Err(e) => {
+                                            eprintln!("UDP error: {e}");
+                                            return;
+                                        }
+                                    }
+                                }
                             } else {
                                 eprintln!("Client disconnected");
                                 break;
