@@ -9,7 +9,12 @@ rustls = "0.23.35"
 rustls-pki-types = "1.13.0"
 serde = "1.0.228"
 serde_json = "1.0.145"
-str0m = { version = "0.11.1", default-features = false, features = ["wincrypto"] }
 tracing = { version = "0.1.41", features = ["async-await"] }
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
 tungstenite = { version = "0.28.0", features = ["rustls-tls-webpki-roots"] }
+
+[target.'cfg(not(target_os = "windows"))'.dependencies]
+str0m = { version = "0.11.1", default-features = false, features = ["openssl"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+str0m = { version = "0.11.1", default-features = false, features = ["wincrypto"] }
