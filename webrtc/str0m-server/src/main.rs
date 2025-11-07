@@ -41,15 +41,15 @@ impl PlatformConfig {
         #[cfg(windows)]
         {
             Self {
-                initial_batch_size: 5,
+                initial_batch_size: 3,
                 high_water_bytes: 2 * 1024 * 1024,  // 2 MiB
                 low_water_bytes: 1 * 1024 * 1024,   // 1 MiB
                 max_outputs_per_call: 10,
                 success_batches_for_growth: 10,
-                max_batch_size: 20,
+                max_batch_size: 10,
                 min_batch_size: 1,
                 check_backpressure_during_write: true,
-                check_backpressure_every_n_writes: 3,
+                check_backpressure_every_n_writes: 1,
             }
         }
         #[cfg(not(windows))]
