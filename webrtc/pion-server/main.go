@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"runtime"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -84,7 +85,7 @@ func main() {
 						if err := channel.Send([]byte(message)); err != nil {
 							log.Fatal(err)
 						}
-						time.Sleep(1 * time.Millisecond)
+						runtime.Gosched()
 					}
 				}
 				for {
@@ -94,7 +95,7 @@ func main() {
 						}
 						break
 					}
-					time.Sleep(1 * time.Millisecond)
+					runtime.Gosched()
 				}
 			})
 		})
