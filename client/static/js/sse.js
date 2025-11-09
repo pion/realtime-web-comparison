@@ -2,6 +2,7 @@ import {chart, initCanvas, visualizePacket} from "./common.js";
 
 const sseBtn = document.getElementById("sse");
 const serverUrl = "http://localhost:7999";
+const statsNumbers = document.getElementById("stats-numbers");
 
 sseBtn.onclick = (_) => {
     initCanvas()
@@ -12,7 +13,7 @@ sseBtn.onclick = (_) => {
     const eventSource = new EventSource(serverUrl);
 
     eventSource.onopen = (_) => {
-        console.info(`Connection established in ${new Date() - t0} ms.`);
+        statsNumbers.textContent += `SSE Connection established in ${new Date() - t0} ms.`;
         sseBtn.disabled = true
         t0 = new Date();
         chart.data.datasets[3].data.push({x: 0, y: 0});
@@ -29,8 +30,10 @@ sseBtn.onclick = (_) => {
         // Check if we've received all messages (2500 total: 50x50)
         if (messageCount >= 2500) {
             eventSource.close();
-            console.info(`${messageCount} message(s) were received within ${new Date() - t0} ms.`)
+            const timeElapsed = new Date() - t0;
+            console.info(`${messageCount} message(s) were received within ${timeElapsed} ms.`)
             console.info('All messages received. Disconnected from Server Sent Events server.');
+            statsNumbers.textContent += `Received ${messageCount} messages in ${timeElapsed} ms via SSE.`;
             sseBtn.disabled = false;
         }
     }
@@ -44,7 +47,7 @@ sseBtn.onclick = (_) => {
             // Connection dropped mid-stream
             chart.data.datasets[3].data.push({x: new Date() - t0, y: messageCount});
             chart.update();
-            console.info(`Connection interrupted. ${messageCount} message(s) were received within ${new Date() - t0} ms.`)
+            console.info(`Connection interrupted. ${messageCount} message(s) were received within ${timeElapsed} ms.`)
         }
     }
 }
