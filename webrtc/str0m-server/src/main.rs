@@ -23,6 +23,63 @@ use tokio_tungstenite::{accept_async, tungstenite::Message};
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
+// Platform-specific configuration
+struct PlatformConfig {
+    initial_batch_size: usize,
+    high_water_bytes: usize,
+    low_water_bytes: usize,
+    max_outputs_per_call: usize,
+    success_batches_for_growth: usize,
+    max_batch_size: usize,
+    min_batch_size: usize,
+    check_backpressure_during_write: bool,
+    check_backpressure_every_n_writes: usize,
+}
+
+impl PlatformConfig {
+    fn current() -> Self {
+        #[cfg(windows)]
+        {
+            Self {
+                initial_batch_size: 3,
+                high_water_bytes: 2 * 1024 * 1024,  // 2 MiB
+                low_water_bytes: 1 * 1024 * 1024,   // 1 MiB
+                max_outputs_per_call: 10,
+                success_batches_for_growth: 10,
+                max_batch_size: 10,
+                min_batch_size: 1,
+                check_backpressure_during_write: true,
+                check_backpressure_every_n_writes: 1,
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            Self {
+                initial_batch_size: 20,
+                high_water_bytes: 10 * 1024 * 1024, // 10 MiB
+                low_water_bytes: 5 * 1024 * 1024,   // 5 MiB
+                max_outputs_per_call: 50,
+                success_batches_for_growth: 5,
+                max_batch_size: 100,
+                min_batch_size: 10,
+                check_backpressure_during_write: false,
+                check_backpressure_every_n_writes: 0,
+            }
+        }
+    }
+
+    /// Determine if this platform uses conservative (linear) batch growth
+    fn uses_linear_growth(&self) -> bool {
+        #[cfg(windows)]
+        {
+            true
+        }
+        #[cfg(not(windows))]
+        {
+            false
+        }
+    }
+}
 
 #[derive(Deserialize, Debug)]
 #[serde(tag = "type")]
@@ -126,58 +183,7 @@ async fn handle_client(
     let std_udp = udp.into_std()?;
 
     SockRef::from(&std_udp).set_send_buffer_size(20 * 1024 * 1024)?;
-
-    #[cfg(windows)]
-    {
-        use std::os::windows::io::AsRawSocket;
-        use winapi::shared::minwindef::{DWORD, LPVOID};
-        use winapi::um::winsock2::{setsockopt, SO_SNDBUF, SOL_SOCKET, SOCKET_ERROR, WSAGetLastError, WSAIoctl};
-
-        // SIO_UDP_CONNRESET = _WSAIOW(IOC_VENDOR, 12) = 0x9800000C
-        const SIO_UDP_CONNRESET: DWORD = 0x9800000C;
-
-        let socket = std_udp.as_raw_socket();
-        let buffer_size: i32 = 40 * 1024 * 1024;
-        let result = unsafe {
-            setsockopt(
-                socket as _,
-                SOL_SOCKET,
-                SO_SNDBUF,
-                &buffer_size as *const _ as *const _,
-                std::mem::size_of::<i32>() as _,
-            )
-        };
-        if result == SOCKET_ERROR {
-            let err = unsafe { WSAGetLastError() };
-            eprintln!("Warning: Failed to set UDP send buffer size, error: {}", err);
-        } else {
-            eprintln!("Set UDP send buffer to {} bytes", buffer_size);
-        }
-
-        // disable spurious UDP connection reset errors on Windows
-        let mut bytes_returned: DWORD = 0;
-        let mut enable: u32 = 0;
-
-        let rc = unsafe {
-            WSAIoctl(
-                socket as _,
-                SIO_UDP_CONNRESET,
-                &mut enable as *mut _ as LPVOID,
-                std::mem::size_of::<u32>() as DWORD,
-                std::ptr::null_mut(),
-                0,
-                &mut bytes_returned as *mut _,
-                std::ptr::null_mut(),
-                None,
-            )
-        };
-        if rc == SOCKET_ERROR {
-            eprintln!("Warning: failed to set SIO_UDP_CONNRESET");
-        } else {
-            eprintln!("Disabled UDP connection reset errors (SIO_UDP_CONNRESET)");
-        }
-    }
-
+    configure_udp_socket_platform_specific(&std_udp)?;
     let got = SockRef::from(&std_udp).send_buffer_size()?;
     eprintln!("SO_SNDBUF set; effective size = {} bytes", got);
 
@@ -216,7 +222,7 @@ async fn handle_client(
         tokio::net::UdpSocket::from_std(cloned)?
     };
 
-    let mut buf = vec![0u8; 2048];
+    let mut buf = vec![0u8; 65507]; // Maximum UDP packet size for better throughput
     let local_addr_for_recv = SocketAddr::new(IpAddr::V4(bind_ip), local_udp.port());
     let mut next_deadline = Instant::now() + Duration::from_millis(50);
 
@@ -274,6 +280,61 @@ struct UdpIn {
     buf: Vec<u8>,
     src: SocketAddr,
     dst: SocketAddr,
+}
+
+// configure UDP socket with platform-specific settings
+fn configure_udp_socket_platform_specific(_udp_socket: &std::net::UdpSocket) -> anyhow::Result<()> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawSocket;
+        use winapi::shared::minwindef::{DWORD, LPVOID};
+        use winapi::um::winsock2::{setsockopt, SO_SNDBUF, SOL_SOCKET, SOCKET_ERROR, WSAGetLastError, WSAIoctl};
+
+        // SIO_UDP_CONNRESET = _WSAIOW(IOC_VENDOR, 12) = 0x9800000C
+        const SIO_UDP_CONNRESET: DWORD = 0x9800000C;
+
+        let socket = _udp_socket.as_raw_socket();
+        let buffer_size: i32 = 40 * 1024 * 1024;
+        let result = unsafe {
+            setsockopt(
+                socket as _,
+                SOL_SOCKET,
+                SO_SNDBUF,
+                &buffer_size as *const _ as *const _,
+                std::mem::size_of::<i32>() as _,
+            )
+        };
+        if result == SOCKET_ERROR {
+            let err = unsafe { WSAGetLastError() };
+            eprintln!("Warning: Failed to set UDP send buffer size, error: {}", err);
+        } else {
+            eprintln!("Set UDP send buffer to {} bytes", buffer_size);
+        }
+
+        // disable spurious UDP connection reset errors on Windows
+        let mut bytes_returned: DWORD = 0;
+        let mut enable: u32 = 0;
+
+        let rc = unsafe {
+            WSAIoctl(
+                socket as _,
+                SIO_UDP_CONNRESET,
+                &mut enable as *mut _ as LPVOID,
+                std::mem::size_of::<u32>() as DWORD,
+                std::ptr::null_mut(),
+                0,
+                &mut bytes_returned as *mut _,
+                std::ptr::null_mut(),
+                None,
+            )
+        };
+        if rc == SOCKET_ERROR {
+            eprintln!("Warning: failed to set SIO_UDP_CONNRESET");
+        } else {
+            eprintln!("Disabled UDP connection reset errors (SIO_UDP_CONNRESET)");
+        }
+    }
+    Ok(())
 }
 
 // Check if a UDP receive error is something we can safely ignore
@@ -428,6 +489,41 @@ fn pick_bind_v4_for_offer(offer_sdp: &str) -> Ipv4Addr {
     Ipv4Addr::LOCALHOST
 }
 
+// Build RTC configuration with platform-specific settings
+fn build_rtc_config() -> anyhow::Result<str0m::Rtc> {
+    #[cfg(windows)]
+    {
+        let cert_opts = str0m::config::DtlsCertOptions {
+            pkey_type: str0m::config::DtlsPKeyType::Rsa2048,
+            ..Default::default()
+        };
+        let crypto_provider = str0m::config::CryptoProvider::WinCrypto;
+        let dtls_cert = str0m::config::DtlsCert::new(crypto_provider, cert_opts);
+        let str0m_config = str0m::RtcConfig::new()
+            .set_dtls_cert_config(str0m::DtlsCertConfig::PregeneratedCert(dtls_cert));
+        Ok(str0m_config.build())
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(str0m::RtcConfig::new().build())
+    }
+}
+
+// Platform-specific sleep strategy
+fn platform_sleep(_did_work: bool) {
+    #[cfg(windows)]
+    {
+        // Keep normal sleep time even when sending to avoid overwhelming Windows
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    #[cfg(not(windows))]
+    {
+        if !_did_work {
+            std::thread::yield_now();
+        }
+    }
+}
+
 fn run_rtc_thread(
     offer_sdp: String,
     local_ip: IpAddr,
@@ -439,25 +535,7 @@ fn run_rtc_thread(
     answer_out: cb::Sender<String>,
     udp_socket: Arc<std::net::UdpSocket>,
 ) -> anyhow::Result<()> {
-    let mut rtc = {
-        #[cfg(windows)]
-        {
-            // trying to fix it for firefox on windows?
-            let cert_opts = str0m::config::DtlsCertOptions {
-                pkey_type: str0m::config::DtlsPKeyType::Rsa2048,
-                ..Default::default()
-            };
-            let crypto_provider = str0m::config::CryptoProvider::WinCrypto;
-            let dtls_cert = str0m::config::DtlsCert::new(crypto_provider, cert_opts);
-            let str0m_config = str0m::RtcConfig::new()
-                .set_dtls_cert_config(str0m::DtlsCertConfig::PregeneratedCert(dtls_cert));
-            str0m_config.build()
-        }
-        #[cfg(not(windows))]
-        {
-            str0m::RtcConfig::new().build()
-        }
-    };
+    let mut rtc = build_rtc_config()?;
 
     let local_addr = SocketAddr::new(local_ip, udp_port);
     let local_candidate = Candidate::host(local_addr, "udp")?;
@@ -476,13 +554,16 @@ fn run_rtc_thread(
     let mut backpressure_state = BackpressureState::new();
 
 
-    let (mut next_deadline, _) = drain_outputs(&mut rtc, udp_socket.as_ref(), &mut channel_id, &mut messages_to_send, &mut message_index, &mut backpressure_state)?;
+    let (mut next_deadline, _, _) = drain_outputs(&mut rtc, udp_socket.as_ref(), &mut channel_id, &mut messages_to_send, &mut message_index, &mut backpressure_state)?;
     let _ = next_out.send(next_deadline);
 
     let _ = answer_out.send(answer_sdp);
 
     loop {
+        let mut did_work = false;
+
         while let Ok(ws_msg) = ws_in.try_recv() {
+            did_work = true;
             match ws_msg {
                 WsInbound::Candidate { candidate, .. } => {
                     try_add_remote_candidate(&mut rtc, &candidate, local_ip)
@@ -493,6 +574,7 @@ fn run_rtc_thread(
         }
         // Drain inbound UDP
         while let Ok(UdpIn { buf, src, dst }) = udp_in.try_recv() {
+            did_work = true;
             let contents: &[u8] = &buf;
             if let Ok(contents_slice) = contents.try_into() {
                 let input = Input::Receive(
@@ -513,21 +595,26 @@ fn run_rtc_thread(
             }
         }
         while let Ok(()) = timeout_in.try_recv() {
+            did_work = true;
             if let Err(e) = rtc.handle_input(Input::Timeout(Instant::now())) {
                 eprintln!("Error handling timeout: {e}");
             }
         }
 
-        try_write_messages(&mut rtc, &channel_id, &messages_to_send, &mut message_index, &mut backpressure_state);
+        push_messages(&mut rtc, &channel_id, &messages_to_send, &mut message_index, &mut backpressure_state);
 
-        let (nd, _connected_state) = drain_outputs(&mut rtc, udp_socket.as_ref(), &mut channel_id, &mut messages_to_send, &mut message_index, &mut backpressure_state)?;
+        let (nd, _connected_state, processed_outputs) = drain_outputs(&mut rtc, udp_socket.as_ref(), &mut channel_id, &mut messages_to_send, &mut message_index, &mut backpressure_state)?;
+        if processed_outputs {
+            did_work = true;
+        }
         if nd != next_deadline {
+            did_work = true;
             next_deadline = nd;
             let _ = next_out.send(next_deadline);
         }
 
-        // Keep normal sleep time even when sending to avoid overwhelming Windows
-        std::thread::sleep(Duration::from_millis(1));
+        // Platform-specific sleep strategy
+        platform_sleep(did_work);
     }
 }
 
@@ -535,43 +622,78 @@ struct BackpressureState {
     consecutive_errors: usize,
     successful_batches: usize,
     current_batch_size: usize,
+    // SCTP-aware flow control
+    paused_by_sctp: bool,
+    high_water_bytes: usize,
+    low_water_bytes: usize,
+    last_buffered_bytes: usize,
+    platform_config: PlatformConfig,
 }
 
 impl BackpressureState {
     fn new() -> Self {
-        let initial = 5;
+        let platform_config = PlatformConfig::current();
         Self {
             consecutive_errors: 0,
             successful_batches: 0,
-            current_batch_size: initial,
-        }
-    }
-
-    fn adjust_for_backpressure(&mut self, written: usize, had_error: bool, batch_size: usize) {
-        if had_error {
-            self.consecutive_errors += 1;
-            self.successful_batches = 0;
-            self.current_batch_size = (self.current_batch_size / 2).max(1);
-        } else {
-            self.consecutive_errors = 0;
-            if written == batch_size && written > 0 {
-                self.successful_batches += 1;
-                if self.successful_batches >= 10 && self.current_batch_size < 20 {
-                    self.current_batch_size += 1;
-                    self.successful_batches = 0;
-                }
-            } else if written == 0 && batch_size > 1 {
-                self.current_batch_size = (self.current_batch_size * 2 / 3).max(1);
-            }
+            current_batch_size: platform_config.initial_batch_size,
+            paused_by_sctp: false,
+            high_water_bytes: platform_config.high_water_bytes,
+            low_water_bytes: platform_config.low_water_bytes,
+            last_buffered_bytes: 0,
+            platform_config,
         }
     }
 
     fn batch_size(&self) -> usize {
         self.current_batch_size
     }
+
+    fn should_pause_for(&self, buffered: usize) -> bool {
+        buffered >= self.high_water_bytes
+    }
+
+    fn low_threshold(&self) -> usize {
+        self.low_water_bytes
+    }
+
+    fn adjust_for_backpressure(&mut self, written: usize, had_error: bool, batch_size: usize) {
+        if had_error {
+            self.consecutive_errors += 1;
+            self.successful_batches = 0;
+            self.current_batch_size = (self.current_batch_size / 2).max(self.platform_config.min_batch_size);
+        } else {
+            self.consecutive_errors = 0;
+            if written == batch_size && written > 0 {
+                self.successful_batches += 1;
+                if self.successful_batches >= self.platform_config.success_batches_for_growth
+                    && self.current_batch_size < self.platform_config.max_batch_size
+                {
+                    if self.platform_config.uses_linear_growth() {
+                        // conservative growth
+                        self.current_batch_size += 1;
+                    } else {
+                        // exponential growth
+                        self.current_batch_size = (self.current_batch_size * 3 / 2).min(self.platform_config.max_batch_size);
+                    }
+                    self.successful_batches = 0;
+                }
+            } else if written == 0 && batch_size > 1 {
+                self.current_batch_size = (self.current_batch_size * 2 / 3).max(self.platform_config.min_batch_size);
+            }
+        }
+    }
+
+    fn check_backpressure_during_write(&self) -> bool {
+        self.platform_config.check_backpressure_during_write
+    }
+
+    fn check_backpressure_every_n_writes(&self) -> usize {
+        self.platform_config.check_backpressure_every_n_writes
+    }
 }
 
-fn try_write_messages(
+fn push_messages(
     rtc: &mut str0m::Rtc,
     channel_id: &Option<str0m::channel::ChannelId>,
     messages_to_send: &[String],
@@ -579,38 +701,81 @@ fn try_write_messages(
     backpressure_state: &mut BackpressureState,
 ) {
     if let Some(id) = *channel_id {
-        if *message_index < messages_to_send.len() {
-            if let Some(mut ch) = rtc.channel(id) {
-                let batch_size = backpressure_state.batch_size();
-                let mut written = 0;
-                let mut had_error = false;
+        if *message_index >= messages_to_send.len() {
+            if *message_index == messages_to_send.len() && !messages_to_send.is_empty() {
+                eprintln!("Finished sending all {} messages", messages_to_send.len());
+                *message_index += 1;
+            }
+            return;
+        }
 
-                while *message_index < messages_to_send.len() && written < batch_size {
-                    let message = &messages_to_send[*message_index];
-                    match ch.write(false, message.as_bytes()) {
-                        Ok(bytes_written) => {
-                            if bytes_written == 0 {
-                                had_error = true;
-                                break;
-                            }
-                            *message_index += 1;
-                            written += 1;
-                        }
-                        Err(e) => {
-                            if *message_index > 50 {
-                                eprintln!("Write error at message {}: {:?}", message_index, e);
-                            }
+        if let Some(mut ch) = rtc.channel(id) {
+            // Check if we're paused by SCTP backpressure
+            if backpressure_state.paused_by_sctp {
+                let buffered_now = ch.buffered_amount();
+                if buffered_now < backpressure_state.low_threshold() {
+                    backpressure_state.paused_by_sctp = false;
+                } else {
+                    return;
+                }
+            }
+
+            // Check backpressure before writing (Windows-specific behavior)
+            if backpressure_state.check_backpressure_during_write() {
+                let ba = ch.buffered_amount();
+                if backpressure_state.should_pause_for(ba) {
+                    ch.set_buffered_amount_low_threshold(backpressure_state.low_threshold());
+                    backpressure_state.paused_by_sctp = true;
+                    return;
+                }
+            }
+
+            let batch_size = backpressure_state.batch_size();
+            let mut written = 0usize;
+            let mut had_error = false;
+            let check_every_n = backpressure_state.check_backpressure_every_n_writes();
+
+            // Write messages in batches
+            while *message_index < messages_to_send.len() && written < batch_size {
+                let message = &messages_to_send[*message_index];
+                match ch.write(false, message.as_bytes()) {
+                    Ok(bytes_written) => {
+                        if bytes_written == 0 {
                             had_error = true;
                             break;
                         }
+                        *message_index += 1;
+                        written += 1;
+
+                        // Check backpressure periodically during batch writes (if configured)
+                        if check_every_n > 0 && written % check_every_n == 0 {
+                            let ba = ch.buffered_amount();
+                            if backpressure_state.should_pause_for(ba) {
+                                ch.set_buffered_amount_low_threshold(backpressure_state.low_threshold());
+                                backpressure_state.paused_by_sctp = true;
+                                break;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        if *message_index > 50 {
+                            eprintln!("Write error at message {}: {:?}", message_index, e);
+                        }
+                        had_error = true;
+                        break;
                     }
                 }
-
-                backpressure_state.adjust_for_backpressure(written, had_error, batch_size);
             }
-        } else if *message_index == messages_to_send.len() && !messages_to_send.is_empty() {
-            eprintln!("Finished sending all {} messages", messages_to_send.len());
-            *message_index += 1;
+
+            // Check backpressure after writing a batch
+            let ba = ch.buffered_amount();
+            backpressure_state.last_buffered_bytes = ba;
+            if backpressure_state.should_pause_for(ba) {
+                ch.set_buffered_amount_low_threshold(backpressure_state.low_threshold());
+                backpressure_state.paused_by_sctp = true;
+            }
+
+            backpressure_state.adjust_for_backpressure(written, had_error, batch_size);
         }
     }
 }
@@ -622,19 +787,19 @@ fn drain_outputs(
     messages_to_send: &mut Vec<String>,
     message_index: &mut usize,
     backpressure_state: &mut BackpressureState,
-) -> anyhow::Result<(Instant, bool)> {
+) -> anyhow::Result<(Instant, bool, bool)> {
     let mut connected = false;
     let mut next_timeout = None;
     let mut output_count = 0;
-    const MAX_OUTPUTS_PER_CALL: usize = 10; // Process fewer outputs to avoid overwhelming
+    let max_outputs_per_call = PlatformConfig::current().max_outputs_per_call;
 
     loop {
         match rtc.poll_output()? {
             Output::Timeout(t) => {
                 next_timeout = Some(t);
-                try_write_messages(rtc, channel_id, messages_to_send, message_index, backpressure_state);
+                push_messages(rtc, channel_id, messages_to_send, message_index, backpressure_state);
                 output_count += 1;
-                if output_count >= MAX_OUTPUTS_PER_CALL {
+                if output_count >= max_outputs_per_call {
                     break;
                 }
             },
@@ -646,7 +811,7 @@ fn drain_outputs(
                     eprintln!("UDP send_to error to {}: {}", tx.destination, e);
                 }
                 output_count += 1;
-                if output_count >= MAX_OUTPUTS_PER_CALL {
+                if output_count >= max_outputs_per_call {
                     break;
                 }
             }
@@ -663,6 +828,9 @@ fn drain_outputs(
                         eprintln!("Warning: Channel opened but connection not yet established");
                     }
                     *channel_id = Some(*id);
+                    if let Some(mut ch) = rtc.channel(*id) {
+                        ch.set_buffered_amount_low_threshold(backpressure_state.low_threshold());
+                    }
                     // Generate all messages to send (they will be sent one at a time in the Timeout handler)
                     if messages_to_send.is_empty() {
                         eprintln!("Starting to send messages through data channel");
@@ -686,10 +854,15 @@ fn drain_outputs(
                     eprintln!("DataChannel closed: id={id:?}");
                     *channel_id = None;
                 }
+                Event::ChannelBufferedAmountLow(id2) => {
+                    eprintln!("BufferedAmountLow for {:?} — resuming writes", id2);
+                    backpressure_state.paused_by_sctp = false;
+                    push_messages(rtc, channel_id, messages_to_send, message_index, backpressure_state);
+                }
                 _ => {}
                 }
                 output_count += 1;
-                if output_count >= MAX_OUTPUTS_PER_CALL {
+                if output_count >= max_outputs_per_call {
                     break;
                 }
             },
@@ -697,7 +870,8 @@ fn drain_outputs(
     }
 
     let timeout = next_timeout.unwrap_or_else(|| Instant::now() + Duration::from_millis(10));
-    Ok((timeout, connected))
+    let processed_any = output_count > 0;
+    Ok((timeout, connected, processed_any))
 }
 
 fn try_add_remote_candidate(rtc: &mut str0m::Rtc, candidate: &str, local_ip: IpAddr) {
