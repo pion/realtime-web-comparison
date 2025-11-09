@@ -1,8 +1,7 @@
-import {chart, initCanvas, visualizePacket} from "./common.js";
+import {chart, initCanvas, visualizePacket, statsNumbers} from "./common.js";
 
 const sseBtn = document.getElementById("sse");
 const serverUrl = "http://localhost:7999";
-const statsNumbers = document.getElementById("stats-numbers");
 
 sseBtn.onclick = (_) => {
     initCanvas()
