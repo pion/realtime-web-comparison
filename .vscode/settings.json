@@ -1,0 +1,7 @@
+{
+    "rust-analyzer.linkedProjects": [
+        "server-sent-events\\axum-sse\\Cargo.toml",
+        "webrtc\\str0m-server\\Cargo.toml",
+        "websocket\\tungstenite-server\\Cargo.toml"
+    ]
+}

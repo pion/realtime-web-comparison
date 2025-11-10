@@ -59,7 +59,6 @@ fn main() {
                                         eprintln!("send error: {e}");
                                         break;
                                     }
-                                    std::thread::sleep(std::time::Duration::from_millis(1));
                                 }
                             }
                             // break after one batch for demo purposes

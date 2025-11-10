@@ -1,4 +1,4 @@
-import {chart, initCanvas, visualizePacket} from "./common.js";
+import {chart, initCanvas, visualizePacket, statsNumbers} from "./common.js";
 
 const webSocketBtn = document.getElementById("websocket");
 const serverUrl = "wss://localhost:8000";
@@ -12,7 +12,7 @@ webSocketBtn.onclick = (_) => {
     const client = new WebSocket(serverUrl);
 
     client.onopen = (_) => {
-        console.info(`Connection established in ${new Date() - t0} ms.`);
+        statsNumbers.textContent += `Connection established in ${new Date() - t0} ms.`;
         webSocketBtn.disabled = true
         t0 = new Date();
         chart.data.datasets[0].data.push({x: 0, y: 0});
@@ -30,7 +30,7 @@ webSocketBtn.onclick = (_) => {
     client.onclose = (_) => {
         chart.data.datasets[0].data.push({x: new Date() - t0, y: messageCount});
         chart.update();
-        console.info(`${messageCount} message(s) were received within ${new Date() - t0} ms.`)
+        statsNumbers.textContent += `${messageCount} message(s) were received within ${new Date() - t0} ms.`;
         console.info('Disconnected from WebSocket server.');
     }
 

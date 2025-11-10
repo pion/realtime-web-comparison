@@ -82,3 +82,5 @@ export function visualizePacket(packet) {
         9
     )
 }
+
+export const statsNumbers = document.getElementById("stats-numbers");

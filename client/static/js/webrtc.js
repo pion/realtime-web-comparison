@@ -1,4 +1,4 @@
-import {chart, initCanvas, visualizePacket} from "./common.js";
+import {chart, initCanvas, visualizePacket, statsNumbers} from "./common.js";
 
 const webRTCBtn = document.getElementById("webrtc");
 const reliable = false;
@@ -58,7 +58,7 @@ webRTCBtn.onclick = (_) => {
     }
 
     dataChannel.onopen = () => {
-        console.info(`WebRTC DataChannel established in ${new Date() - t0} ms.`);
+        statsNumbers.textContent += `WebRTC DataChannel established in ${new Date() - t0} ms.`;
     };
 
     dataChannel.onmessage = async (e) => {
@@ -94,7 +94,7 @@ webRTCBtn.onclick = (_) => {
     }
 
     dataChannel.onclose = () => {
-        console.info(`${messageCount} message(s) were received within ${new Date() - t0} ms.`)
+        statsNumbers.textContent += `${messageCount} message(s) were received within ${new Date() - t0} ms.`;
         console.info('Disconnected from WebRTC server.');
     };
 
