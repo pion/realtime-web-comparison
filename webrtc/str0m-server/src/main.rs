@@ -1,27 +1,47 @@
 // str0m test server with a single tokio::select! loop (WS, UDP, timer)
 // should keeps the WebSocket/TLS flow unchanged as other clients. tested on Windows & Linux by.
 // doesn't work on firefox on windows (dtls handshake fails).
+use bytes::Bytes;
+use crossbeam_channel as cb;
+use futures_util::{SinkExt, StreamExt};
+use http_body_util::Full;
+use hyper::{
+    body::Incoming,
+    header::{CONNECTION, SEC_WEBSOCKET_ACCEPT, SEC_WEBSOCKET_KEY, UPGRADE},
+    http::StatusCode,
+    server::conn::http1,
+    service::service_fn,
+    upgrade::Upgraded,
+    Method, Request, Response,
+};
+use hyper_util::rt::TokioIo;
+use if_addrs::get_if_addrs;
+use mimalloc::MiMalloc;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use serde::{Deserialize, Serialize};
+use socket2::SockRef;
 use std::error::Error;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use socket2::SockRef;
-use crossbeam_channel as cb;
-use futures_util::{SinkExt, StreamExt};
-use if_addrs::get_if_addrs;
-use mimalloc::MiMalloc;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use serde::{Deserialize, Serialize};
 use str0m::net::{Protocol, Receive};
 use str0m::{Candidate, Event, Input, Output};
+use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::time::{sleep_until, Instant as TokioInstant};
-use tokio_rustls::{server::TlsStream, TlsAcceptor};
-use tokio_tungstenite::{accept_async, tungstenite::Message};
+use tokio_rustls::TlsAcceptor;
+use tokio_tungstenite::{
+    tungstenite::{handshake::derive_accept_key, protocol::Role, Message},
+    WebSocketStream,
+};
 
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
+
+const TLS_BIND_IP: &str = "127.0.0.1";
+const TLS_BIND_PORT: u16 = 8002;
+const REDIRECT_HOST: &str = "localhost";
 
 // Platform-specific configuration
 struct PlatformConfig {
@@ -42,8 +62,8 @@ impl PlatformConfig {
         {
             Self {
                 initial_batch_size: 3,
-                high_water_bytes: 2 * 1024 * 1024,  // 2 MiB
-                low_water_bytes: 1 * 1024 * 1024,   // 1 MiB
+                high_water_bytes: 2 * 1024 * 1024, // 2 MiB
+                low_water_bytes: 1 * 1024 * 1024,  // 1 MiB
                 max_outputs_per_call: 10,
                 success_batches_for_growth: 10,
                 max_batch_size: 10,
@@ -140,8 +160,9 @@ async fn main() -> anyhow::Result<()> {
         .with_single_cert(vec![cert], key)?;
     let acceptor = TlsAcceptor::from(Arc::new(rustls_cfg));
 
-    let listener = TcpListener::bind("127.0.0.1:8002").await?;
-    eprintln!("Listening on wss://127.0.0.1:8002");
+    let bind_addr = format!("{TLS_BIND_IP}:{TLS_BIND_PORT}");
+    let listener = TcpListener::bind(&bind_addr).await?;
+    eprintln!("Listening on wss://{bind_addr}");
 
     loop {
         let (tcp, _) = listener.accept().await?;
@@ -155,15 +176,127 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
-// This function handles one WebRTC connection from start to finish
-async fn handle_client(
-    acceptor: TlsAcceptor,
-    tcp: tokio::net::TcpStream,
-) -> anyhow::Result<()> {
-    let tls: TlsStream<_> = acceptor.accept(tcp).await?;
-    let mut ws = accept_async(tls).await?;
+async fn handle_client(acceptor: TlsAcceptor, tcp: tokio::net::TcpStream) -> anyhow::Result<()> {
+    // detect http and redirect to https
+    let mut peek_buf = [0u8; 1];
+    if let Ok(n) = tcp.peek(&mut peek_buf).await {
+        if n > 0 && peek_buf[0].is_ascii_alphabetic() {
+            respond_with_http_redirect(tcp).await?;
+            return Ok(());
+        }
+    }
 
-    let first_msg = ws.next().await.ok_or_else(|| anyhow::anyhow!("client closed"))??;
+    let tls = acceptor.accept(tcp).await?;
+    let io = TokioIo::new(tls);
+    http1::Builder::new()
+        .serve_connection(io, service_fn(handle_http))
+        .with_upgrades()
+        .await?;
+    Ok(())
+}
+
+async fn respond_with_http_redirect(mut tcp: tokio::net::TcpStream) -> anyhow::Result<()> {
+    const BODY: &str = "Redirecting to HTTPS\r\n";
+    let response = format!(
+        "HTTP/1.1 302 Found\r\n\
+         Location: https://{host}:{port}/\r\n\
+         Content-Type: text/plain; charset=utf-8\r\n\
+         Content-Length: {length}\r\n\
+         Connection: close\r\n\
+         \r\n",
+        host = REDIRECT_HOST,
+        port = TLS_BIND_PORT,
+        length = BODY.len()
+    );
+
+    tcp.write_all(response.as_bytes()).await?;
+    tcp.write_all(BODY.as_bytes()).await?;
+    tcp.shutdown().await?;
+    Ok(())
+}
+async fn handle_http(req: Request<Incoming>) -> Result<Response<Full<Bytes>>, hyper::Error> {
+    if !is_websocket_upgrade(&req) {
+        let body = Full::new(Bytes::from_static(
+            b"WebRTC Signaling Server - Use WebSocket connection for signaling",
+        ));
+        let response = Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "text/plain; charset=utf-8")
+            .header("Connection", "close")
+            .body(body)
+            .unwrap();
+        return Ok(response);
+    }
+
+    let key = match req.headers().get(SEC_WEBSOCKET_KEY) {
+        Some(k) => k.clone(),
+        None => {
+            return Ok(Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .body(Full::new(Bytes::from_static(
+                    b"Missing Sec-WebSocket-Key header",
+                )))
+                .unwrap());
+        }
+    };
+
+    let accept_key = derive_accept_key(key.as_bytes());
+
+    tokio::spawn(async move {
+        match hyper::upgrade::on(req).await {
+            Ok(upgraded) => {
+                let upgraded = TokioIo::new(upgraded);
+                let ws = WebSocketStream::from_raw_socket(upgraded, Role::Server, None).await;
+                if let Err(err) = handle_signaling(ws).await {
+                    eprintln!("Client error: {err:?}");
+                }
+            }
+            Err(err) => eprintln!("WebSocket upgrade error: {err:?}"),
+        }
+    });
+
+    Ok(Response::builder()
+        .status(StatusCode::SWITCHING_PROTOCOLS)
+        .header(CONNECTION, "Upgrade")
+        .header(UPGRADE, "websocket")
+        .header(SEC_WEBSOCKET_ACCEPT, accept_key)
+        .body(Full::new(Bytes::new()))
+        .unwrap())
+}
+
+fn is_websocket_upgrade(req: &Request<Incoming>) -> bool {
+    if req.method() != Method::GET {
+        return false;
+    }
+
+    connection_header_contains_upgrade(req)
+        && req
+            .headers()
+            .get(UPGRADE)
+            .and_then(|value| value.to_str().ok())
+            .map(|value| value.eq_ignore_ascii_case("websocket"))
+            .unwrap_or(false)
+        && req.headers().contains_key(SEC_WEBSOCKET_KEY)
+}
+
+fn connection_header_contains_upgrade(req: &Request<Incoming>) -> bool {
+    req.headers()
+        .get(CONNECTION)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| {
+            value
+                .split(',')
+                .any(|token| token.trim().eq_ignore_ascii_case("upgrade"))
+        })
+        .unwrap_or(false)
+}
+
+// This function handles one WebRTC connection from start to finish after the WebSocket upgrade.
+async fn handle_signaling(mut ws: WebSocketStream<TokioIo<Upgraded>>) -> anyhow::Result<()> {
+    let first_msg = ws
+        .next()
+        .await
+        .ok_or_else(|| anyhow::anyhow!("client closed"))??;
     let offer = match first_msg {
         Message::Text(t) => serde_json::from_str::<WsInbound>(&t)?,
         Message::Binary(b) => serde_json::from_slice::<WsInbound>(&b)?,
@@ -288,7 +421,9 @@ fn configure_udp_socket_platform_specific(_udp_socket: &std::net::UdpSocket) -> 
     {
         use std::os::windows::io::AsRawSocket;
         use winapi::shared::minwindef::{DWORD, LPVOID};
-        use winapi::um::winsock2::{setsockopt, SO_SNDBUF, SOL_SOCKET, SOCKET_ERROR, WSAGetLastError, WSAIoctl};
+        use winapi::um::winsock2::{
+            setsockopt, WSAGetLastError, WSAIoctl, SOCKET_ERROR, SOL_SOCKET, SO_SNDBUF,
+        };
 
         // SIO_UDP_CONNRESET = _WSAIOW(IOC_VENDOR, 12) = 0x9800000C
         const SIO_UDP_CONNRESET: DWORD = 0x9800000C;
@@ -306,7 +441,10 @@ fn configure_udp_socket_platform_specific(_udp_socket: &std::net::UdpSocket) -> 
         };
         if result == SOCKET_ERROR {
             let err = unsafe { WSAGetLastError() };
-            eprintln!("Warning: Failed to set UDP send buffer size, error: {}", err);
+            eprintln!(
+                "Warning: Failed to set UDP send buffer size, error: {}",
+                err
+            );
         } else {
             eprintln!("Set UDP send buffer to {} bytes", buffer_size);
         }
@@ -398,9 +536,9 @@ fn same_lan_prefix(a: Ipv4Addr, b: Ipv4Addr) -> u32 {
         return 16; // Same /16 subnet
     }
     if ao[0] == bo[0] {
-        return 8;  // Same /8 subnet
+        return 8; // Same /8 subnet
     }
-    0  // No common prefix
+    0 // No common prefix
 }
 
 // Check if a network interface name suggests it's a virtual/tunnel interface
@@ -553,8 +691,14 @@ fn run_rtc_thread(
     let mut message_index = 0;
     let mut backpressure_state = BackpressureState::new();
 
-
-    let (mut next_deadline, _, _) = drain_outputs(&mut rtc, udp_socket.as_ref(), &mut channel_id, &mut messages_to_send, &mut message_index, &mut backpressure_state)?;
+    let (mut next_deadline, _, _) = drain_outputs(
+        &mut rtc,
+        udp_socket.as_ref(),
+        &mut channel_id,
+        &mut messages_to_send,
+        &mut message_index,
+        &mut backpressure_state,
+    )?;
     let _ = next_out.send(next_deadline);
 
     let _ = answer_out.send(answer_sdp);
@@ -601,9 +745,22 @@ fn run_rtc_thread(
             }
         }
 
-        push_messages(&mut rtc, &channel_id, &messages_to_send, &mut message_index, &mut backpressure_state);
+        push_messages(
+            &mut rtc,
+            &channel_id,
+            &messages_to_send,
+            &mut message_index,
+            &mut backpressure_state,
+        );
 
-        let (nd, _connected_state, processed_outputs) = drain_outputs(&mut rtc, udp_socket.as_ref(), &mut channel_id, &mut messages_to_send, &mut message_index, &mut backpressure_state)?;
+        let (nd, _connected_state, processed_outputs) = drain_outputs(
+            &mut rtc,
+            udp_socket.as_ref(),
+            &mut channel_id,
+            &mut messages_to_send,
+            &mut message_index,
+            &mut backpressure_state,
+        )?;
         if processed_outputs {
             did_work = true;
         }
@@ -661,7 +818,8 @@ impl BackpressureState {
         if had_error {
             self.consecutive_errors += 1;
             self.successful_batches = 0;
-            self.current_batch_size = (self.current_batch_size / 2).max(self.platform_config.min_batch_size);
+            self.current_batch_size =
+                (self.current_batch_size / 2).max(self.platform_config.min_batch_size);
         } else {
             self.consecutive_errors = 0;
             if written == batch_size && written > 0 {
@@ -674,12 +832,14 @@ impl BackpressureState {
                         self.current_batch_size += 1;
                     } else {
                         // exponential growth
-                        self.current_batch_size = (self.current_batch_size * 3 / 2).min(self.platform_config.max_batch_size);
+                        self.current_batch_size = (self.current_batch_size * 3 / 2)
+                            .min(self.platform_config.max_batch_size);
                     }
                     self.successful_batches = 0;
                 }
             } else if written == 0 && batch_size > 1 {
-                self.current_batch_size = (self.current_batch_size * 2 / 3).max(self.platform_config.min_batch_size);
+                self.current_batch_size =
+                    (self.current_batch_size * 2 / 3).max(self.platform_config.min_batch_size);
             }
         }
     }
@@ -751,7 +911,9 @@ fn push_messages(
                         if check_every_n > 0 && written % check_every_n == 0 {
                             let ba = ch.buffered_amount();
                             if backpressure_state.should_pause_for(ba) {
-                                ch.set_buffered_amount_low_threshold(backpressure_state.low_threshold());
+                                ch.set_buffered_amount_low_threshold(
+                                    backpressure_state.low_threshold(),
+                                );
                                 backpressure_state.paused_by_sctp = true;
                                 break;
                             }
@@ -797,12 +959,18 @@ fn drain_outputs(
         match rtc.poll_output()? {
             Output::Timeout(t) => {
                 next_timeout = Some(t);
-                push_messages(rtc, channel_id, messages_to_send, message_index, backpressure_state);
+                push_messages(
+                    rtc,
+                    channel_id,
+                    messages_to_send,
+                    message_index,
+                    backpressure_state,
+                );
                 output_count += 1;
                 if output_count >= max_outputs_per_call {
                     break;
                 }
-            },
+            }
             Output::Transmit(tx) => {
                 if let Err(e) = udp_socket.send_to(&tx.contents, tx.destination) {
                     if is_send_einval_to_non_loopback(&e, tx.destination) {
@@ -817,55 +985,63 @@ fn drain_outputs(
             }
             Output::Event(ev) => {
                 match &ev {
-                Event::IceConnectionStateChange(state) => eprintln!("ICE state: {state:?}"),
-                Event::Connected => {
-                    eprintln!("WebRTC CONNECTED! ICE and DTLS established.");
-                    connected = true;
-                }
-                Event::ChannelOpen(id, label) => {
-                    eprintln!("DataChannel opened: id={id:?}, label={label}");
-                    if !connected {
-                        eprintln!("Warning: Channel opened but connection not yet established");
+                    Event::IceConnectionStateChange(state) => eprintln!("ICE state: {state:?}"),
+                    Event::Connected => {
+                        eprintln!("WebRTC CONNECTED! ICE and DTLS established.");
+                        connected = true;
                     }
-                    *channel_id = Some(*id);
-                    if let Some(mut ch) = rtc.channel(*id) {
-                        ch.set_buffered_amount_low_threshold(backpressure_state.low_threshold());
-                    }
-                    // Generate all messages to send (they will be sent one at a time in the Timeout handler)
-                    if messages_to_send.is_empty() {
-                        eprintln!("Starting to send messages through data channel");
-                        // Send message so we can test the server performance
-                        // Write messages and continue polling to ensure they're sent
-                        // This is critical on Windows where writes are buffered
-                        // Queue messages instead of writing them all at once
+                    Event::ChannelOpen(id, label) => {
+                        eprintln!("DataChannel opened: id={id:?}, label={label}");
+                        if !connected {
+                            eprintln!("Warning: Channel opened but connection not yet established");
+                        }
+                        *channel_id = Some(*id);
+                        if let Some(mut ch) = rtc.channel(*id) {
+                            ch.set_buffered_amount_low_threshold(
+                                backpressure_state.low_threshold(),
+                            );
+                        }
+                        // Generate all messages to send (they will be sent one at a time in the Timeout handler)
                         if messages_to_send.is_empty() {
-                            eprintln!("Generating messages to send");
-                            for i in (10..=510).step_by(10) {
-                                for j in (10..=510).step_by(10) {
-                                    messages_to_send.push(format!("{j},{i}"));
+                            eprintln!("Starting to send messages through data channel");
+                            // Send message so we can test the server performance
+                            // Write messages and continue polling to ensure they're sent
+                            // This is critical on Windows where writes are buffered
+                            // Queue messages instead of writing them all at once
+                            if messages_to_send.is_empty() {
+                                eprintln!("Generating messages to send");
+                                for i in (10..=510).step_by(10) {
+                                    for j in (10..=510).step_by(10) {
+                                        messages_to_send.push(format!("{j},{i}"));
+                                    }
                                 }
+                                eprintln!("Generated {} messages to send", messages_to_send.len());
                             }
-                            eprintln!("Generated {} messages to send", messages_to_send.len());
                         }
                     }
-                }
-                Event::ChannelData(data) => eprintln!("DataChannel received: {data:?}"),
-                Event::ChannelClose(id) => {
-                    eprintln!("DataChannel closed: id={id:?}");
-                    *channel_id = None;
-                }
-                Event::ChannelBufferedAmountLow(id2) => {
-                    eprintln!("BufferedAmountLow for {:?} — resuming writes", id2);
-                    backpressure_state.paused_by_sctp = false;
-                    push_messages(rtc, channel_id, messages_to_send, message_index, backpressure_state);
-                }
-                _ => {}
+                    Event::ChannelData(data) => eprintln!("DataChannel received: {data:?}"),
+                    Event::ChannelClose(id) => {
+                        eprintln!("DataChannel closed: id={id:?}");
+                        *channel_id = None;
+                    }
+                    Event::ChannelBufferedAmountLow(id2) => {
+                        eprintln!("BufferedAmountLow for {:?} — resuming writes", id2);
+                        backpressure_state.paused_by_sctp = false;
+                        push_messages(
+                            rtc,
+                            channel_id,
+                            messages_to_send,
+                            message_index,
+                            backpressure_state,
+                        );
+                    }
+                    _ => {}
                 }
                 output_count += 1;
                 if output_count >= max_outputs_per_call {
                     break;
                 }
-            },
+            }
         }
     }
 
@@ -875,7 +1051,9 @@ fn drain_outputs(
 }
 
 fn try_add_remote_candidate(rtc: &mut str0m::Rtc, candidate: &str, local_ip: IpAddr) {
-    let line = candidate.trim_start_matches("a=").trim_start_matches("candidate:");
+    let line = candidate
+        .trim_start_matches("a=")
+        .trim_start_matches("candidate:");
     let parts: Vec<&str> = line.split_whitespace().collect();
     if parts.len() < 6 {
         return;
