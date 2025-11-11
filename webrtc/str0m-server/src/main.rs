@@ -421,7 +421,9 @@ fn configure_udp_socket_platform_specific(_udp_socket: &std::net::UdpSocket) -> 
     {
         use std::os::windows::io::AsRawSocket;
         use winapi::shared::minwindef::{DWORD, LPVOID};
-        use winapi::um::winsock2::{setsockopt, SO_SNDBUF, SOL_SOCKET, SOCKET_ERROR, WSAGetLastError, WSAIoctl};
+        use winapi::um::winsock2::{
+            setsockopt, WSAGetLastError, WSAIoctl, SOCKET_ERROR, SOL_SOCKET, SO_SNDBUF,
+        };
 
         // SIO_UDP_CONNRESET = _WSAIOW(IOC_VENDOR, 12) = 0x9800000C
         const SIO_UDP_CONNRESET: DWORD = 0x9800000C;
@@ -439,7 +441,10 @@ fn configure_udp_socket_platform_specific(_udp_socket: &std::net::UdpSocket) -> 
         };
         if result == SOCKET_ERROR {
             let err = unsafe { WSAGetLastError() };
-            eprintln!("Warning: Failed to set UDP send buffer size, error: {}", err);
+            eprintln!(
+                "Warning: Failed to set UDP send buffer size, error: {}",
+                err
+            );
         } else {
             eprintln!("Set UDP send buffer to {} bytes", buffer_size);
         }
@@ -531,9 +536,9 @@ fn same_lan_prefix(a: Ipv4Addr, b: Ipv4Addr) -> u32 {
         return 16; // Same /16 subnet
     }
     if ao[0] == bo[0] {
-        return 8;  // Same /8 subnet
+        return 8; // Same /8 subnet
     }
-    0  // No common prefix
+    0 // No common prefix
 }
 
 // Check if a network interface name suggests it's a virtual/tunnel interface
@@ -686,8 +691,14 @@ fn run_rtc_thread(
     let mut message_index = 0;
     let mut backpressure_state = BackpressureState::new();
 
-
-    let (mut next_deadline, _, _) = drain_outputs(&mut rtc, udp_socket.as_ref(), &mut channel_id, &mut messages_to_send, &mut message_index, &mut backpressure_state)?;
+    let (mut next_deadline, _, _) = drain_outputs(
+        &mut rtc,
+        udp_socket.as_ref(),
+        &mut channel_id,
+        &mut messages_to_send,
+        &mut message_index,
+        &mut backpressure_state,
+    )?;
     let _ = next_out.send(next_deadline);
 
     let _ = answer_out.send(answer_sdp);
@@ -734,9 +745,22 @@ fn run_rtc_thread(
             }
         }
 
-        push_messages(&mut rtc, &channel_id, &messages_to_send, &mut message_index, &mut backpressure_state);
+        push_messages(
+            &mut rtc,
+            &channel_id,
+            &messages_to_send,
+            &mut message_index,
+            &mut backpressure_state,
+        );
 
-        let (nd, _connected_state, processed_outputs) = drain_outputs(&mut rtc, udp_socket.as_ref(), &mut channel_id, &mut messages_to_send, &mut message_index, &mut backpressure_state)?;
+        let (nd, _connected_state, processed_outputs) = drain_outputs(
+            &mut rtc,
+            udp_socket.as_ref(),
+            &mut channel_id,
+            &mut messages_to_send,
+            &mut message_index,
+            &mut backpressure_state,
+        )?;
         if processed_outputs {
             did_work = true;
         }
@@ -794,7 +818,8 @@ impl BackpressureState {
         if had_error {
             self.consecutive_errors += 1;
             self.successful_batches = 0;
-            self.current_batch_size = (self.current_batch_size / 2).max(self.platform_config.min_batch_size);
+            self.current_batch_size =
+                (self.current_batch_size / 2).max(self.platform_config.min_batch_size);
         } else {
             self.consecutive_errors = 0;
             if written == batch_size && written > 0 {
@@ -807,12 +832,14 @@ impl BackpressureState {
                         self.current_batch_size += 1;
                     } else {
                         // exponential growth
-                        self.current_batch_size = (self.current_batch_size * 3 / 2).min(self.platform_config.max_batch_size);
+                        self.current_batch_size = (self.current_batch_size * 3 / 2)
+                            .min(self.platform_config.max_batch_size);
                     }
                     self.successful_batches = 0;
                 }
             } else if written == 0 && batch_size > 1 {
-                self.current_batch_size = (self.current_batch_size * 2 / 3).max(self.platform_config.min_batch_size);
+                self.current_batch_size =
+                    (self.current_batch_size * 2 / 3).max(self.platform_config.min_batch_size);
             }
         }
     }
@@ -884,7 +911,9 @@ fn push_messages(
                         if check_every_n > 0 && written % check_every_n == 0 {
                             let ba = ch.buffered_amount();
                             if backpressure_state.should_pause_for(ba) {
-                                ch.set_buffered_amount_low_threshold(backpressure_state.low_threshold());
+                                ch.set_buffered_amount_low_threshold(
+                                    backpressure_state.low_threshold(),
+                                );
                                 backpressure_state.paused_by_sctp = true;
                                 break;
                             }
@@ -930,12 +959,18 @@ fn drain_outputs(
         match rtc.poll_output()? {
             Output::Timeout(t) => {
                 next_timeout = Some(t);
-                push_messages(rtc, channel_id, messages_to_send, message_index, backpressure_state);
+                push_messages(
+                    rtc,
+                    channel_id,
+                    messages_to_send,
+                    message_index,
+                    backpressure_state,
+                );
                 output_count += 1;
                 if output_count >= max_outputs_per_call {
                     break;
                 }
-            },
+            }
             Output::Transmit(tx) => {
                 if let Err(e) = udp_socket.send_to(&tx.contents, tx.destination) {
                     if is_send_einval_to_non_loopback(&e, tx.destination) {
@@ -950,49 +985,57 @@ fn drain_outputs(
             }
             Output::Event(ev) => {
                 match &ev {
-                Event::IceConnectionStateChange(state) => eprintln!("ICE state: {state:?}"),
-                Event::Connected => {
-                    eprintln!("WebRTC CONNECTED! ICE and DTLS established.");
-                    connected = true;
-                }
-                Event::ChannelOpen(id, label) => {
-                    eprintln!("DataChannel opened: id={id:?}, label={label}");
-                    if !connected {
-                        eprintln!("Warning: Channel opened but connection not yet established");
+                    Event::IceConnectionStateChange(state) => eprintln!("ICE state: {state:?}"),
+                    Event::Connected => {
+                        eprintln!("WebRTC CONNECTED! ICE and DTLS established.");
+                        connected = true;
                     }
-                    *channel_id = Some(*id);
-                    if let Some(mut ch) = rtc.channel(*id) {
-                        ch.set_buffered_amount_low_threshold(backpressure_state.low_threshold());
-                    }
-                    // Generate all messages to send (they will be sent one at a time in the Timeout handler)
-                    if messages_to_send.is_empty() {
-                        eprintln!("Starting to send messages through data channel");
-                        // Send message so we can test the server performance
-                        // Write messages and continue polling to ensure they're sent
-                        // This is critical on Windows where writes are buffered
-                        // Queue messages instead of writing them all at once
+                    Event::ChannelOpen(id, label) => {
+                        eprintln!("DataChannel opened: id={id:?}, label={label}");
+                        if !connected {
+                            eprintln!("Warning: Channel opened but connection not yet established");
+                        }
+                        *channel_id = Some(*id);
+                        if let Some(mut ch) = rtc.channel(*id) {
+                            ch.set_buffered_amount_low_threshold(
+                                backpressure_state.low_threshold(),
+                            );
+                        }
+                        // Generate all messages to send (they will be sent one at a time in the Timeout handler)
                         if messages_to_send.is_empty() {
-                            eprintln!("Generating messages to send");
-                            for i in (10..=510).step_by(10) {
-                                for j in (10..=510).step_by(10) {
-                                    messages_to_send.push(format!("{j},{i}"));
+                            eprintln!("Starting to send messages through data channel");
+                            // Send message so we can test the server performance
+                            // Write messages and continue polling to ensure they're sent
+                            // This is critical on Windows where writes are buffered
+                            // Queue messages instead of writing them all at once
+                            if messages_to_send.is_empty() {
+                                eprintln!("Generating messages to send");
+                                for i in (10..=510).step_by(10) {
+                                    for j in (10..=510).step_by(10) {
+                                        messages_to_send.push(format!("{j},{i}"));
+                                    }
                                 }
+                                eprintln!("Generated {} messages to send", messages_to_send.len());
                             }
-                            eprintln!("Generated {} messages to send", messages_to_send.len());
                         }
                     }
-                }
-                Event::ChannelData(data) => eprintln!("DataChannel received: {data:?}"),
-                Event::ChannelClose(id) => {
-                    eprintln!("DataChannel closed: id={id:?}");
-                    *channel_id = None;
-                }
-                Event::ChannelBufferedAmountLow(id2) => {
-                    eprintln!("BufferedAmountLow for {:?} — resuming writes", id2);
-                    backpressure_state.paused_by_sctp = false;
-                    push_messages(rtc, channel_id, messages_to_send, message_index, backpressure_state);
-                }
-                _ => {}
+                    Event::ChannelData(data) => eprintln!("DataChannel received: {data:?}"),
+                    Event::ChannelClose(id) => {
+                        eprintln!("DataChannel closed: id={id:?}");
+                        *channel_id = None;
+                    }
+                    Event::ChannelBufferedAmountLow(id2) => {
+                        eprintln!("BufferedAmountLow for {:?} — resuming writes", id2);
+                        backpressure_state.paused_by_sctp = false;
+                        push_messages(
+                            rtc,
+                            channel_id,
+                            messages_to_send,
+                            message_index,
+                            backpressure_state,
+                        );
+                    }
+                    _ => {}
                 }
                 output_count += 1;
                 if output_count >= max_outputs_per_call {
@@ -1008,7 +1051,9 @@ fn drain_outputs(
 }
 
 fn try_add_remote_candidate(rtc: &mut str0m::Rtc, candidate: &str, local_ip: IpAddr) {
-    let line = candidate.trim_start_matches("a=").trim_start_matches("candidate:");
+    let line = candidate
+        .trim_start_matches("a=")
+        .trim_start_matches("candidate:");
     let parts: Vec<&str> = line.split_whitespace().collect();
     if parts.len() < 6 {
         return;
