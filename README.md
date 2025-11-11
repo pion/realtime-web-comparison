@@ -5,7 +5,9 @@ Experimenting with Server Sent Events, WebSocket, WebRTC, and WebTransport by st
 - The WebTransport server currently does not work
 - We're doing our best to update all code to the latest versions of their dependencies.
 
-**Additional notes:**
+## Additional notes
+
+- Original code for this repository was derived from https://github.com/Sh3b0/realtime-web
 
 - UDP Receive buffer size was incremented as suggested in https://github.com/lucas-clemente/quic-go/wiki/UDP-Receive-Buffer-Size
 
