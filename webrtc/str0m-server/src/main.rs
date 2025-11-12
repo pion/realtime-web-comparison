@@ -635,7 +635,7 @@ fn build_rtc_config() -> anyhow::Result<str0m::Rtc> {
             pkey_type: str0m::config::DtlsPKeyType::Rsa2048,
             ..Default::default()
         };
-        let crypto_provider = str0m::config::CryptoProvider::WinCrypto;
+        let crypto_provider = str0m::config::CryptoProvider::Dimpl;
         let dtls_cert = str0m::config::DtlsCert::new(crypto_provider, cert_opts);
         let str0m_config = str0m::RtcConfig::new()
             .set_dtls_cert_config(str0m::DtlsCertConfig::PregeneratedCert(dtls_cert));
