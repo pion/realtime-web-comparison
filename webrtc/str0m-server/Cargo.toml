@@ -31,7 +31,7 @@ mimalloc = []
 winapi = { version = "0.3.9", features = ["winbase", "winsock2", "ws2tcpip"] }
 
 [target.'cfg(not(target_os = "windows"))'.dependencies]
-str0m = { version = "0.11.1", default-features = false, features = ["openssl"] }
+str0m = { git = "https://github.com/algesten/str0m.git", rev = "6c01f6811bf920e6eb6acd954b564079979e4de7", default-features = false, features = ["openssl"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
-str0m = { version = "0.11.1", default-features = false, features = ["wincrypto"] }
+str0m = { git = "https://github.com/algesten/str0m.git", rev = "6c01f6811bf920e6eb6acd954b564079979e4de7", default-features = false, features = ["dimpl"] }
