@@ -22,7 +22,6 @@ async fn sse_handler() -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
                 for j in (10..=510).step_by(10) {
                     let message = format!("{j},{i}");
                     yield Ok(Event::default().data::<String>(message));
-                    std::thread::sleep(std::time::Duration::from_millis(1));
                 }
             }
         println!("All messages sent.");

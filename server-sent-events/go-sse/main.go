@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
-	"time"
+	"runtime"
 
 	"github.com/tmaxmax/go-sse"
 )
@@ -33,7 +33,7 @@ func main() {
 						log.Printf("Error publishing message: %v\n", err)
 						return
 					}
-					time.Sleep(1 * time.Millisecond)
+					runtime.Gosched()
 				}
 			}
 			log.Printf("Finished sending all messages\n")

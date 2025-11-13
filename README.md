@@ -22,7 +22,6 @@ for i := 10; i < 510; i += 10 {
         if err := conn.WriteMessage(websocket.TextMessage, []byte(message)); err != nil {
             log.Fatal(err)
         }
-        time.Sleep(1 * time.Millisecond)
     }
 }
 ```

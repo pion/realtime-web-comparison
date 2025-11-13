@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
-	"time"
+	"runtime"
 
 	"github.com/gorilla/websocket"
 )
@@ -27,7 +27,7 @@ func main() {
 				if err := conn.WriteMessage(websocket.TextMessage, []byte(message)); err != nil {
 					log.Fatal(err)
 				}
-				time.Sleep(1 * time.Millisecond)
+				runtime.Gosched()
 			}
 		}
 		if err := conn.Close(); err != nil {
