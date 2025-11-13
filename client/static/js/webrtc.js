@@ -94,7 +94,7 @@ webRTCBtn.onclick = (_) => {
     }
 
     dataChannel.onclose = () => {
-        statsNumbers.textContent += `${messageCount} message(s) were received within ${new Date() - t0} ms.`;
+        statsNumbers.textContent += `${messageCount} message(s) were received within ${new Date() - t0} ms from WebRTC`;
         console.info('Disconnected from WebRTC server.');
     };
 

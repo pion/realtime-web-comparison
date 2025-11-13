@@ -30,7 +30,7 @@ webSocketBtn.onclick = (_) => {
     client.onclose = (_) => {
         chart.data.datasets[0].data.push({x: new Date() - t0, y: messageCount});
         chart.update();
-        statsNumbers.textContent += `${messageCount} message(s) were received within ${new Date() - t0} ms.`;
+        statsNumbers.textContent += `${messageCount} message(s) were received within ${new Date() - t0} ms from WebSocket`;
         console.info('Disconnected from WebSocket server.');
     }
 
